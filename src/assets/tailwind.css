@@ -1,0 +1,23 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+.dark {
+  color-scheme: dark;
+}
+
+@theme {
+  --color-gray-850: #1e2433;
+}
+
+.search-highlight {
+  background-color: #fef08a;
+  color: #713f12;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+.dark .search-highlight {
+  background-color: rgba(234, 179, 8, 0.25);
+  color: #fde68a;
+}

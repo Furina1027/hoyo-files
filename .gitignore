@@ -1,0 +1,30 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# 编辑器目录
+.vscode
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# 预下载文件（体积大，运行时生成）
+downloads/
+
+# 密钥库备份（历史快照，不入库）
+pkg_version/usm/*.bak*
+pkg_version/usm/*.bak_*

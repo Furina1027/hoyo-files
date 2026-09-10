@@ -1,0 +1,248 @@
+{
+  "7.6.0": {
+    "game": {
+      "full": {
+        "name": "BH3_v7.6.0_b6f1709c3910.7z",
+        "url": "https://autopatchcn.bh3.com/ptpublic/rel/20240624104231_kQdR9e8gTqYZeAgW/PC/BH3_v7.6.0_b6f1709c3910.7z",
+        "checksum": "a57ee807b54071c04316eab4fbcc9526",
+        "size": 18973602618
+      }
+    },
+    "voice": {},
+    "update": {},
+    "decompressed_path": "https://autopatchcn.bh3.com/ptpublic/rel/20240624104231_kQdR9e8gTqYZeAgW/PC/extract",
+    "chunk": null
+  },
+  "7.7.0": {
+    "game": {
+      "full": {
+        "name": "BH3_v7.7.0_5eeabb6f3d34.7z",
+        "url": "https://autopatchcn.bh3.com/ptpublic/rel/20240805104059_mJaMrTOz6gCYOVBW/PC/BH3_v7.7.0_5eeabb6f3d34.7z",
+        "checksum": "c818d3c6f86207ce0da1bbefc2a6ab27",
+        "size": 19504958103
+      }
+    },
+    "voice": {},
+    "update": {},
+    "decompressed_path": "https://autopatchcn.bh3.com/ptpublic/rel/20240805104059_mJaMrTOz6gCYOVBW/PC/extract",
+    "chunk": null
+  },
+  "7.8.0": {
+    "game": {
+      "full": {
+        "name": "BH3_v7.8.0_fa35dfea8144.7z",
+        "url": "https://autopatchcn.bh3.com/ptpublic/rel/20240912162405_49ekXZIjd6SoVTrN/PC/BH3_v7.8.0_fa35dfea8144.7z",
+        "checksum": "3f79160718e94c2048e33a2c4836b263",
+        "size": 19815929692
+      }
+    },
+    "voice": {},
+    "update": {},
+    "decompressed_path": "https://autopatchcn.bh3.com/ptpublic/rel/20240912162405_49ekXZIjd6SoVTrN/PC/extract",
+    "chunk": null
+  },
+  "7.9.0": {
+    "game": {
+      "full": {
+        "name": "BH3_v7.9.0_37db88484689.7z",
+        "url": "https://autopatchcn.bh3.com/ptpublic/rel/20241025151816_Y1hlFtfrB4sR5Scd/PC/BH3_v7.9.0_37db88484689.7z",
+        "checksum": "a8596e0d7b4c1378587ca7818e1dce35",
+        "size": 20610529816
+      }
+    },
+    "voice": {},
+    "update": {},
+    "decompressed_path": "https://autopatchcn.bh3.com/ptpublic/rel/20241025151816_Y1hlFtfrB4sR5Scd/PC/extract",
+    "chunk": null
+  },
+  "7.9.1": {
+    "game": {
+      "full": {
+        "name": "BH3_v7.9.0_37db88484689_m.7z",
+        "url": "https://autopatchcn.bh3.com/ptpublic/rel/20241031142146_Q5Xm5aZOG1hPyJZW/PC/BH3_v7.9.0_37db88484689_m.7z",
+        "checksum": "7c8ce62b48ecdd54c61c5e140f04e008",
+        "size": 20467806960
+      }
+    },
+    "voice": {},
+    "update": {
+      "7.9.0": {
+        "game": {
+          "name": "game_7.9.0_7.9.1_diff_eKgosBseIgDxwyKn.7z",
+          "url": "https://autopatchcn.bh3.com/tmp/pc_client/product/update/bh3_cn/game_7.9.0_7.9.1_diff_eKgosBseIgDxwyKn.7z",
+          "checksum": "f56c5c15375b5c08ab4af93a2b0276a3",
+          "size": 9989
+        },
+        "voice": {}
+      }
+    },
+    "decompressed_path": "https://autopatchcn.bh3.com/ptpublic/rel/20241031142146_Q5Xm5aZOG1hPyJZW/PC/extract",
+    "chunk": null
+  },
+  "8.0.0": {
+    "game": {
+      "full": {
+        "name": "BH3_v8.0.0_3606071aed85.7z",
+        "url": "https://autopatchcn.bh3.com/ptpublic/rel/20241208070032_L5tMaxvchIF0LKZg/PC/BH3_v8.0.0_3606071aed85.7z",
+        "checksum": "abe19df4dc97434f6291053b967903d5",
+        "size": 21132460087
+      }
+    },
+    "voice": {},
+    "update": {},
+    "decompressed_path": "https://autopatchcn.bh3.com/ptpublic/rel/20241208070032_L5tMaxvchIF0LKZg/PC/extract",
+    "chunk": null
+  },
+  "8.1.0": {
+    "game": {
+      "full": {
+        "name": "BH3_v8.1.0_2b0009e73965.7z",
+        "url": "https://autopatchcn.bh3.com/ptpublic/rel/20250120104717_JKPilwZ9G9BSw6JF/PC/BH3_v8.1.0_2b0009e73965.7z",
+        "checksum": "d2eb8d6db52f542170edacf00f97476f",
+        "size": 21846386552
+      }
+    },
+    "voice": {},
+    "update": {},
+    "decompressed_path": "https://autopatchcn.bh3.com/ptpublic/rel/20250120104717_JKPilwZ9G9BSw6JF/PC/extract",
+    "chunk": null
+  },
+  "8.2.0": {
+    "game": {
+      "full": {
+        "name": "BH3_v8.2.0_070c445c9ac0.7z",
+        "url": "https://autopatchcn.bh3.com/ptpublic/rel/20250321105946_GHQTTjbASRjRe2s6/PC/BH3_v8.2.0_070c445c9ac0.7z",
+        "checksum": "9f16eb08a73c55f258b9844ed2095435",
+        "size": 21834314960
+      }
+    },
+    "voice": {},
+    "update": {},
+    "decompressed_path": "https://autopatchcn.bh3.com/ptpublic/rel/20250321105946_GHQTTjbASRjRe2s6/PC/extract",
+    "chunk": {
+      "branch": "main",
+      "diff_tags": [],
+      "package_id": "jdEaAE9pKa",
+      "password": "h6XjD8ReKlR1",
+      "tag": "8.2.0"
+    }
+  },
+  "8.3.0": {
+    "game": {
+      "full": {
+        "name": "BH3_v8.3.0_f2e1345adb47.7z",
+        "url": "https://autopatchcn.bh3.com/ptpublic/rel/20250523115648_9RU48di9UxAQIixO/PC/BH3_v8.3.0_f2e1345adb47.7z",
+        "checksum": "67bab0aa1f618baddfb6713ade7b053e",
+        "size": 22491072482
+      }
+    },
+    "voice": {},
+    "update": {},
+    "decompressed_path": "https://autopatchcn.bh3.com/ptpublic/rel/20250523115648_9RU48di9UxAQIixO/PC/extract",
+    "chunk": {
+      "branch": "main",
+      "diff_tags": [],
+      "package_id": "jdEaAE9pKa",
+      "password": "h6XjD8ReKlR1",
+      "tag": "8.3.0"
+    }
+  },
+  "8.4.0": {
+    "game": {
+      "full": {
+        "name": "BH3_v8.4.0_589030804b01.7z",
+        "url": "https://autopatchcn.bh3.com/ptpublic/rel/20250717152657_HmMWzKltujR0bm3L/PC/BH3_v8.4.0_589030804b01.7z",
+        "checksum": "e7aece7f28a667bba9ea0769c30fd16d",
+        "size": 23003662135
+      }
+    },
+    "voice": {},
+    "update": {},
+    "decompressed_path": "https://autopatchcn.bh3.com/ptpublic/rel/20250717152657_HmMWzKltujR0bm3L/PC/extract",
+    "chunk": {
+      "branch": "main",
+      "diff_tags": [],
+      "package_id": "jdEaAE9pKa",
+      "password": "h6XjD8ReKlR1",
+      "tag": "8.4.0"
+    }
+  },
+  "8.5.0": {
+    "game": {},
+    "voice": {},
+    "update": {},
+    "decompressed_path": null,
+    "chunk": {
+      "branch": "main",
+      "diff_tags": [],
+      "package_id": "jdEaAE9pKa",
+      "password": "h6XjD8ReKlR1",
+      "tag": "8.5.0"
+    }
+  },
+  "8.6.0": {
+    "game": {},
+    "voice": {},
+    "update": {},
+    "decompressed_path": null,
+    "chunk": {
+      "branch": "main",
+      "diff_tags": [],
+      "package_id": "jdEaAE9pKa",
+      "password": "h6XjD8ReKlR1",
+      "tag": "8.6.0"
+    }
+  },
+  "8.7.0": {
+    "game": {},
+    "voice": {},
+    "update": {},
+    "decompressed_path": null,
+    "chunk": {
+      "branch": "main",
+      "diff_tags": [],
+      "package_id": "jdEaAE9pKa",
+      "password": "h6XjD8ReKlR1",
+      "tag": "8.7.0"
+    }
+  },
+  "8.8.0": {
+    "game": {},
+    "voice": {},
+    "update": {},
+    "decompressed_path": null,
+    "chunk": {
+      "branch": "main",
+      "diff_tags": [],
+      "package_id": "jdEaAE9pKa",
+      "password": "h6XjD8ReKlR1",
+      "tag": "8.8.0"
+    }
+  },
+  "8.9.0": {
+    "game": {},
+    "voice": {},
+    "update": {},
+    "decompressed_path": null,
+    "chunk": {
+      "branch": "main",
+      "diff_tags": [],
+      "package_id": "jdEaAE9pKa",
+      "password": "h6XjD8ReKlR1",
+      "tag": "8.9.0"
+    }
+  },
+  "9.0.0": {
+    "game": {},
+    "voice": {},
+    "update": {},
+    "decompressed_path": null,
+    "chunk": {
+      "branch": "main",
+      "diff_tags": [],
+      "package_id": "jdEaAE9pKa",
+      "password": "h6XjD8ReKlR1",
+      "tag": "9.0.0"
+    }
+  }
+}
