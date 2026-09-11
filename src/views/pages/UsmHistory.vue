@@ -17,10 +17,13 @@ const usmDecodeEnabled = computed(() => {
   return game?.features?.includes('usm-decode') ?? false
 })
 
-const usmKeyMap = ref<Record<string, string> | null>(null)
+const usmKeyMap = ref<Record<string, UsmKeyEntry> | null>(null)
+// 按路径的 key 覆盖表: 绝区零有同名但内容不同的视频, keys.json 只能按文件名存一把
+const usmPathKeyMap = ref<Record<string, UsmKeyEntry> | null>(null)
 
 watch(gameId, async () => {
   usmKeyMap.value = null
+  usmPathKeyMap.value = null
   if (!usmDecodeEnabled.value)
     return
   try {
@@ -29,10 +32,39 @@ watch(gameId, async () => {
       usmKeyMap.value = await res.json()
   }
   catch {}
+  try {
+    const res = await fetch(`${API_BASE}/usm/${gameId.value}_keys_by_path.json`)
+    if (res.ok) {
+      const json = await res.json()
+      const map = (json && typeof json === 'object' && json.keys) ? json.keys : json
+      if (map && typeof map === 'object')
+        usmPathKeyMap.value = map
+    }
+  }
+  catch {}
 }, { immediate: true })
+
+const stripUsmExt = (p: string) => p.replace(/\\/g, '/').replace(/\.usm$/i, '')
 
 function findUsmKey(base: string): UsmKeyEntry | null {
   return usmKeyMap.value?.[base] ?? null
+}
+
+/** 取 key: 先按路径命中覆盖表, 再退回按文件名 —— 同名文件必须靠路径区分 */
+function findUsmKeyForPath(filePath: string): UsmKeyEntry | null {
+  const noExt = stripUsmExt(filePath)
+  const map = usmPathKeyMap.value
+  if (map) {
+    const low = noExt.toLowerCase()
+    for (const [k, v] of Object.entries(map)) {
+      if (!v)
+        continue
+      const kk = stripUsmExt(k).toLowerCase()
+      if (low === kk || low.endsWith(`/${kk}`))
+        return v as UsmKeyEntry
+    }
+  }
+  return findUsmKey(noExt.split('/').pop() ?? '')
 }
 
 interface ProcessedFile {
@@ -370,9 +402,9 @@ const playableSet = computed<Set<string>>(() => {
   const allGameVersions = sortedVersionList.value
 
   for (const file of allFiles.value) {
-    const base = file.filename.replace(/\.usm$/i, '')
     // 无 key 的不显示可播放; 有 key (全零=明文 / 非零=加密) 均可播放
-    const key = findUsmKey(base)
+    // 按 path 判定: 同名不同内容的视频各自取自己的 key
+    const key = findUsmKeyForPath(file.path)
     if (!key)
       continue
 
@@ -389,14 +421,13 @@ const playableSet = computed<Set<string>>(() => {
     })
 
     if (hasResource)
-      set.add(base)
+      set.add(file.path)
   }
   return set
 })
 
 function isFilePlayable(file: ProcessedFile): boolean {
-  const base = file.filename.replace(/\.usm$/i, '')
-  return playableSet.value.has(base)
+  return playableSet.value.has(file.path)
 }
 
 interface PlayerState {
@@ -444,9 +475,8 @@ async function onChunkDownload(chunkVersion: string, entryVersion: string) {
   }
 }
 
-function getEntryKey(filename: string): UsmKeyEntry | null {
-  const base = filename.replace(/\.usm$/i, '')
-  return findUsmKey(base)
+function getEntryKey(filePath: string): UsmKeyEntry | null {
+  return findUsmKeyForPath(filePath)
 }
 
 function onPlay(
@@ -456,7 +486,7 @@ function onPlay(
   if (!selectedFile.value)
     return
   // key 全零=明文, 非零=加密; 播放按钮只对有 key 的文件显示
-  const keyEntry = getEntryKey(selectedFile.value.filename) ?? ''
+  const keyEntry = getEntryKey(selectedFile.value.path) ?? ''
   playerState.value = {
     filename: selectedFile.value.filename,
     keyEntry,

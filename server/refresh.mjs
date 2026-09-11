@@ -1467,14 +1467,71 @@ function concatBytes(parts) {
   return out
 }
 
-/** 从 {game}_keys.json 查文件名对应的 key 原始条目 (16位hex 字符串 或 {aes,audio} 对象; keys 以纯文件名为键) */
+const jsonCache = new Map()
+
+/** 读 JSON（按 mtime 缓存，避免每次请求都重复解析同一个大文件） */
+function readJsonCached(file) {
+  try {
+    const mtimeMs = fs.statSync(file).mtimeMs
+    const hit = jsonCache.get(file)
+    if (hit && hit.mtimeMs === mtimeMs)
+      return hit.data
+    const data = JSON.parse(fs.readFileSync(file, 'utf-8'))
+    jsonCache.set(file, { mtimeMs, data })
+    return data
+  }
+  catch {
+    return null
+  }
+}
+
+/**
+ * 按路径的 key 覆盖表 {game}_keys_by_path.json（可选）:
+ *   { "keys": { "相对视频根且去掉 .usm 的路径": key条目 } }
+ * 绝区零存在同名但内容不同的视频（Transfer/HollowLoading/* 与 Yorozuya/* 等），
+ * 官方给它们配了**不同**的 key，而 keys.json 只能按文件名存一把 —— 靠本表区分。
+ */
+function loadUsmPathKeys(dataDir, game) {
+  if (!dataDir || !game)
+    return null
+  const j = readJsonCached(path.join(dataDir, 'usm', `${game}_keys_by_path.json`))
+  if (!j || typeof j !== 'object')
+    return null
+  const map = (j.keys && typeof j.keys === 'object') ? j.keys : j
+  const entries = Object.entries(map).filter(([k, v]) => k && typeof k === 'string' && typeof v === 'string' && v)
+  return entries.length ? entries : null
+}
+
+/** 在路径覆盖表里匹配：整段路径相同，或给出的路径以表内条目结尾（兼容带前缀/绝对路径） */
+function matchPathKey(entries, file) {
+  const noExt = String(file).replace(/\\/g, '/').replace(/\.usm$/i, '')
+  const low = noExt.toLowerCase()
+  for (const [k, v] of entries) {
+    const kk = String(k).replace(/\\/g, '/').replace(/\.usm$/i, '').toLowerCase()
+    if (low === kk || low.endsWith(`/${kk}`))
+      return v
+  }
+  return undefined
+}
+
+/**
+ * 查文件名/路径对应的 key 原始条目 (16位hex 字符串 或 {aes,audio} 对象)。
+ * 顺序: 路径覆盖表(精确到目录) → {game}_keys.json(纯文件名)。
+ * 同名不同内容的视频必须靠路径命中，否则会拿到另一个同名文件的 key。
+ */
 function findUsmKey(dataDir, game, file) {
   if (!dataDir || !game || !file)
     return ''
   try {
-    const base = path.basename(file).replace(/\.usm$/i, '')
-    const keys = JSON.parse(fs.readFileSync(path.join(dataDir, 'usm', `${game}_keys.json`), 'utf-8'))
-    return keys[base] ?? ''
+    const pathKeys = loadUsmPathKeys(dataDir, game)
+    if (pathKeys) {
+      const hit = matchPathKey(pathKeys, file)
+      if (hit !== undefined)
+        return hit
+    }
+    const base = path.basename(String(file).replace(/\\/g, '/')).replace(/\.usm$/i, '')
+    const keys = readJsonCached(path.join(dataDir, 'usm', `${game}_keys.json`))
+    return (keys && keys[base]) ?? ''
   }
   catch {
     return ''

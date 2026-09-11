@@ -50,27 +50,63 @@ const GAME_NAMES = {
   hk4e: '原神',
   nap: '绝区零',
 }
+/**
+ * 从请求的 file 里剥出「相对视频根」的路径，用于同根内精确命中。
+ * 例: ZenlessZoneZero_Data/StreamingAssets/Video/HD/Yorozuya/Skyscraper/X.usm + 视频根
+ *     ZenlessZoneZero_Data/StreamingAssets/Video/HD  →  Yorozuya/Skyscraper/X.usm
+ * 识别不出已知视频根时返回 null（此时完全退回旧的按文件名查找行为）。
+ */
+function relWithinVideoRoots(file, dirs) {
+  const norm = String(file).replace(/\\/g, '/').replace(/^\/+/, '')
+  for (const sub of dirs) {
+    const s = String(sub).replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
+    if (!s) continue
+    if (norm === s) return ''
+    if (norm.startsWith(`${s}/`)) return norm.slice(s.length + 1)
+    const idx = norm.indexOf(`/${s}/`)
+    if (idx !== -1) return norm.slice(idx + s.length + 2)
+  }
+  return null
+}
+
 function fetchLocalUsm(game, file, log = () => {}, customRoot = null) {
   const root = customRoot || GAME_DIRS[game]
   const dirs = GAME_VIDEO_DIRS[game]
   if (!root || !dirs) return null
-  const base = path.basename(file)
+  const base = path.basename(String(file).replace(/\\/g, '/'))
   if (!base.toLowerCase().endsWith('.usm')) return null
+  const rel = relWithinVideoRoots(file, dirs)
+  const relLow = rel ? rel.toLowerCase() : null
+  const readAt = (p, how) => {
+    const buf = fs.readFileSync(p)
+    log(`[usm] 使用本地游戏文件${how}: ${p} (${buf.length} 字节)`)
+    return new Uint8Array(buf)
+  }
+  // 1) 按请求里的目录精确命中（同名文件很多，只认文件名会拿错那一份）。
+  //    注意根的顺序仍是 Persistent → StreamingAssets，热更优先级不变。
+  if (rel) {
+    for (const sub of dirs) {
+      const p = path.join(root, sub, rel)
+      try {
+        if (fs.existsSync(p))
+          return readAt(p, '')
+      } catch { /* 忽略 */ }
+    }
+  }
   for (const sub of dirs) {
     const p = path.join(root, sub, base)
     try {
-      if (fs.existsSync(p)) {
-        const buf = fs.readFileSync(p)
-        log(`[usm] 使用本地游戏文件: ${p} (${buf.length} 字节)`)
-        return new Uint8Array(buf)
-      }
+      if (fs.existsSync(p))
+        return readAt(p, '')
     } catch { /* 忽略 */ }
   }
   // 绝区零等分层的目录: 基名直查未命中时做受限递归搜索
+  // （同一根内若存在与请求路径尾部完全一致的那一份，优先取它；否则退回第一个同名命中）
   for (const sub of dirs) {
     const rootDir = path.join(root, sub)
     try {
       if (!fs.existsSync(rootDir)) continue
+      let fallback = null
       const stack = [rootDir]
       while (stack.length) {
         const cur = stack.pop()
@@ -79,12 +115,16 @@ function fetchLocalUsm(game, file, log = () => {}, customRoot = null) {
           if (e.isDirectory()) {
             if (stack.length < 32) stack.push(cp)
           } else if (e.name === base) {
-            const buf = fs.readFileSync(cp)
-            log(`[usm] 使用本地游戏文件(递归): ${cp} (${buf.length} 字节)`)
-            return new Uint8Array(buf)
+            if (!relLow)
+              return readAt(cp, '(递归)')
+            if (cp.replace(/\\/g, '/').toLowerCase().endsWith(`/${relLow}`))
+              return readAt(cp, '(递归/精确路径)')
+            if (!fallback) fallback = cp
           }
         }
       }
+      if (fallback)
+        return readAt(fallback, '(递归)')
     } catch { /* 忽略 */ }
   }
   return null
