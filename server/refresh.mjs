@@ -693,7 +693,7 @@ export async function downloadPredownloadFiles(gameId, dataDir, { files = null, 
 
   const hpatchz = findHpatchz()
   if (!hpatchz)
-    throw new Error('未找到 hpatchz (HDiffPatch), 请设置 HPATCHZ 环境变量或放置于 hoyo-sophon/third_party/')
+    throw new Error('未找到 hpatchz (HDiffPatch), 请设置 HPATCHZ 环境变量或放置于 third_party/hpatchz.exe')
 
   const root = path.resolve(outRoot ?? path.join(dataDir, '..', 'downloads'), gameId)
   const bundleCache = path.join(root, '.bundle_cache')
