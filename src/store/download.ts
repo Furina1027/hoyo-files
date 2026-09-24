@@ -1,12 +1,12 @@
 import type { ChunkManifest, DownloadStatus, DownloadTask, GameFileRecord, ParsedFile } from '@/types'
+import type { UsmKeyEntry } from '@/utils/usm_demux'
 import { defineStore } from 'pinia'
 import { API_BASE } from '@/constants/core'
+import { decodeAdx, extractAdxFromUsm } from '@/utils/adx_decoder'
 import { downloadChunks } from '@/utils/chunk'
 import { fetchAndParseManifest } from '@/utils/manifest'
-import { decodeUsmToMkv, getUsmStreamDecoder } from '@/utils/usm'
-import { decodeAdx, extractAdxFromUsm } from '@/utils/adx_decoder'
-import type { UsmKeyEntry } from '@/utils/usm_demux'
 import { injectPcmAudioToWebm } from '@/utils/mkvmux'
+import { decodeUsmToMkv, getUsmStreamDecoder } from '@/utils/usm'
 
 function concatU8(parts: Uint8Array[]): Uint8Array {
   const total = parts.reduce((s, p) => s + p.length, 0)
@@ -373,6 +373,26 @@ export const useDownload = defineStore('download', () => {
       setTaskStatus(task.id, 'merging')
       setTaskProgress(task.id, 99)
       triggerDownload(`${baseName}.mp4`, bytes, 'video/mp4')
+      return
+    }
+
+    const reunion67Alias = gameId === 'hk4e' && filePath.replace(/\\/g, '/').split('/').pop()?.toLowerCase() === 'video_reunion_67_test.usm'
+    if (fmt === 'vp9' && gameId === 'hk4e' && (typeof keyEntry === 'object' || reunion67Alias)) {
+      const t = tasks.value.find(x => x.id === task.id)
+      if (t)
+        t.name = `${baseName}.mkv`
+      const mkvParams = new URLSearchParams(params)
+      if (data.chIndex != null)
+        mkvParams.set('ch', String(data.chIndex))
+      const res = await fetch(`${API_BASE}/api/usm-mkv?${mkvParams}`, { signal })
+      if (!res.ok) {
+        const text = await res.text().catch(() => '')
+        throw new Error(text.replace(/^USM 转换失败:\s*/, '') || `HTTP ${res.status}`)
+      }
+      const bytes = await streamResponseWithProgress(res, pct => setTaskProgress(task.id, pct))
+      setTaskStatus(task.id, 'merging')
+      setTaskProgress(task.id, 99)
+      triggerDownload(`${baseName}.mkv`, bytes, 'video/x-matroska')
       return
     }
 

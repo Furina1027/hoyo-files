@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import type { GameFileRecord, VersionEntry } from '@/types'
+import type { UsmKeyEntry } from '@/utils/usm_demux'
 import { useGameVersions } from '@/api/files'
 import { useUsmHistory } from '@/api/usm'
 import { API_BASE, GameList } from '@/constants/core'
 import { useDownload } from '@/store/download'
 import { useSettings } from '@/store/settings'
 import { formatBytes, highlightText } from '@/utils/file'
-import type { UsmKeyEntry } from '@/utils/usm_demux'
 import { compareSemver, sortVersions } from '@/utils/semver'
 
 const route = useRoute()
@@ -164,7 +164,9 @@ async function handleRefreshUsmHistory() {
   }
   finally {
     usmRefreshing.value = false
-    setTimeout(() => { usmRefreshResult.value = null }, 6000)
+    setTimeout(() => {
+      usmRefreshResult.value = null
+    }, 6000)
   }
 }
 
@@ -396,31 +398,87 @@ const settings = useSettings()
 
 const chunkLoadingVersion = ref<string | null>(null)
 
-const playableSet = computed<Set<string>>(() => {
-  const set = new Set<string>()
+/** 该文件在 CDN 侧是否取得到字节（任一「存在过」的版本能落到 直链 或 chunk） */
+function hasCdnResource(file: ProcessedFile): boolean {
   const vData = versionsQuery.data.value ?? {}
   const allGameVersions = sortedVersionList.value
+  const availableVersions = file.versions
+    .filter(v => v.state === 'AVAILABLE')
+    .map(v => v.version)
+    .sort(compareSemver)
+
+  return file.versions.some((entry) => {
+    if (entry.state !== 'AVAILABLE')
+      return false
+    const candidates = getEntryCandidates(file.versions, entry.version, availableVersions, allGameVersions)
+    return candidates.some(gv => vData[gv]?.decompressed_path || vData[gv]?.chunk)
+  })
+}
+
+/** 本地游戏目录里存在的 USM 路径（CDN 已下架时的回退来源） */
+const localUsmPaths = ref<Set<string>>(new Set())
+/** 本地命中的来源信息（仅用于展示） */
+const localUsmInfo = ref<Record<string, { path: string, source: string, size: number | null }>>({})
+
+function getLocalGameDir(game: string): string | null {
+  try {
+    return localStorage.getItem(`game_dir_${game}`) || null
+  }
+  catch {
+    return null
+  }
+}
+
+/**
+ * 对「CDN 取不到字节」的文件回退查本地游戏目录。
+ * 定位交给数据服务器（Persistent 热更 → StreamingAssets → 递归兜底），
+ * 顺序与播放/导出时真正取字节的顺序完全一致，避免「判定能播、实际取不到」。
+ * 纯静态部署没有该接口，请求失败即静默保持原判定。
+ */
+async function refreshLocalUsm() {
+  const files = allFiles.value
+  if (!usmDecodeEnabled.value || !files.length)
+    return
+  const pending = files
+    .filter(f => findUsmKeyForPath(f.path) && !hasCdnResource(f))
+    .map(f => f.path)
+  if (!pending.length) {
+    localUsmPaths.value = new Set()
+    localUsmInfo.value = {}
+    return
+  }
+  try {
+    const res = await fetch(`${API_BASE}/api/usm-local-files`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ game: gameId.value, game_dir: getLocalGameDir(gameId.value), files: pending }),
+    })
+    if (!res.ok)
+      return
+    const data = await res.json() as {
+      found?: Record<string, { path: string, source: string, size: number | null }>
+    }
+    const found = data.found ?? {}
+    localUsmPaths.value = new Set(Object.keys(found))
+    localUsmInfo.value = found
+  }
+  catch { /* 静态部署 / 服务器不可达: 保持「CDN 不可用即不可播放」 */ }
+}
+
+watch([allFiles, () => versionsQuery.data.value, gameId], () => {
+  refreshLocalUsm()
+})
+
+const playableSet = computed<Set<string>>(() => {
+  const set = new Set<string>()
 
   for (const file of allFiles.value) {
     // 无 key 的不显示可播放; 有 key (全零=明文 / 非零=加密) 均可播放
     // 按 path 判定: 同名不同内容的视频各自取自己的 key
-    const key = findUsmKeyForPath(file.path)
-    if (!key)
+    if (!findUsmKeyForPath(file.path))
       continue
-
-    const availableVersions = file.versions
-      .filter(v => v.state === 'AVAILABLE')
-      .map(v => v.version)
-      .sort(compareSemver)
-
-    const hasResource = file.versions.some((entry) => {
-      if (entry.state !== 'AVAILABLE')
-        return false
-      const candidates = getEntryCandidates(file.versions, entry.version, availableVersions, allGameVersions)
-      return candidates.some(gv => vData[gv]?.decompressed_path || vData[gv]?.chunk)
-    })
-
-    if (hasResource)
+    // CDN 取不到时, 本地游戏目录里有也能播 (服务器取字节时会优先读本地)
+    if (hasCdnResource(file) || localUsmPaths.value.has(file.path))
       set.add(file.path)
   }
   return set
@@ -430,6 +488,15 @@ function isFilePlayable(file: ProcessedFile): boolean {
   return playableSet.value.has(file.path)
 }
 
+/** CDN 侧已下架、只能靠本地游戏文件播放 */
+function isLocalOnly(file: ProcessedFile): boolean {
+  return localUsmPaths.value.has(file.path) && !hasCdnResource(file)
+}
+
+function localSourceOf(file: ProcessedFile) {
+  return localUsmInfo.value[file.path] ?? null
+}
+
 interface PlayerState {
   filename: string
   keyEntry: UsmKeyEntry
@@ -437,6 +504,10 @@ interface PlayerState {
   bestChunkVersion: string | null
   gameId: string
   filePath: string
+  /** 本地游戏目录已确认存在（CDN 侧可能已下架） */
+  localAvailable: boolean
+  /** 后端使用历史同源文件静默替代当前文件。 */
+  serverAlias: boolean
 }
 
 const playerState = ref<PlayerState | null>(null)
@@ -479,6 +550,11 @@ function getEntryKey(filePath: string): UsmKeyEntry | null {
   return findUsmKeyForPath(filePath)
 }
 
+function isReunion67TestFile(filePath: string): boolean {
+  const fileName = filePath.replace(/\\/g, '/').split('/').pop()?.toLowerCase()
+  return fileName === 'video_reunion_67_test.usm'
+}
+
 function onPlay(
   directDownloadUrl: string | null,
   bestChunkVersion: string | null,
@@ -494,6 +570,10 @@ function onPlay(
     bestChunkVersion,
     gameId: gameId.value,
     filePath: selectedFile.value.path,
+    // CDN 已下架但本地游戏目录里有: 播放器据此继续尝试服务器端的本地回退
+    localAvailable: localUsmPaths.value.has(selectedFile.value.path),
+    // 前端继续显示 67_test；后端静默使用历史 67，界面不提示替换。
+    serverAlias: gameId.value === 'hk4e' && isReunion67TestFile(selectedFile.value.path),
   }
 }
 
@@ -690,7 +770,7 @@ function onExportMkv(
                   <span
                     v-if="isFilePlayable(file)"
                     class="shrink-0 rounded px-1 py-0.5 text-[10px] font-medium leading-none bg-green-100 text-green-600 dark:bg-green-900/30 dark:text-green-400"
-                  >可播放</span>
+                  >{{ isLocalOnly(file) ? '可播放·本地' : '可播放' }}</span>
                 </div>
                 <div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-gray-500 dark:text-gray-400">
                   <span v-if="file.changeType" class="flex items-center">
@@ -805,12 +885,18 @@ function onExportMkv(
                     </div>
                     <div class="mt-2 flex flex-wrap gap-1.5">
                       <span
-                        v-if="!entry.directDownloadUrl && !entry.bestChunkVersion"
+                        v-if="!entry.directDownloadUrl && !entry.bestChunkVersion && !localSourceOf(selectedFile!)"
                         class="text-xs text-gray-400 dark:text-gray-500"
                       >
                         无可用资源
                       </span>
                       <template v-else>
+                        <span
+                          v-if="!entry.directDownloadUrl && !entry.bestChunkVersion"
+                          class="text-xs text-gray-500 dark:text-gray-400"
+                        >
+                          官方 CDN 已下架，改用本地游戏文件（{{ localSourceOf(selectedFile!)?.source }}）
+                        </span>
                         <button
                           v-if="entry.directDownloadUrl"
                           class="inline-flex items-center gap-1 rounded-md bg-blue-50 px-2 py-1 text-xs font-medium text-blue-600 hover:bg-blue-100 dark:bg-blue-900/20 dark:text-blue-400 dark:hover:bg-blue-900/40"
@@ -862,6 +948,8 @@ function onExportMkv(
     :key-entry="playerState.keyEntry"
     :direct-download-url="playerState.directDownloadUrl"
     :best-chunk-version="playerState.bestChunkVersion"
+    :local-available="playerState.localAvailable"
+    :server-alias="playerState.serverAlias"
     :game-id="playerState.gameId"
     :file-path="playerState.filePath"
     @close="playerState = null"

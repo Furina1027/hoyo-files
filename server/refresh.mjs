@@ -500,8 +500,70 @@ function compareVersions(a, b) {
 }
 
 /**
+ * 用预下载差异，把「基准版本的 USM 清单」推演成「预下载版本的 USM 清单」。
+ *
+ * 预下载 payload 只保存相对某个基准版本的 added/modified/deleted，没有完整清单，
+ * 因此需要 base(基准版本 pkg_version 清单) + 差异 合成 —— 与下载功能同一套语义。
+ * 基准版本优先取 payload.current_version，其次取 tags 中本地有清单的最新者。
+ */
+function synthPredownloadList(dataDir, gameId, pre, log = () => {}) {
+  const tags = [pre.current_version, ...(pre.tags ?? [])].filter(Boolean)
+  let baseTag = null
+  let base = null
+  for (const t of tags) {
+    const list = readUsmFilesFromList(dataDir, gameId, t)
+    if (list) {
+      baseTag = t
+      base = list
+      break
+    }
+  }
+  if (!base) {
+    log(`[${gameId}] 预下载清单推演失败: 基准版本清单都不存在 (${tags.join(', ') || '无'})`)
+    return null
+  }
+  const entries = pre.diffs?.[baseTag]?.entries
+  if (!entries) {
+    log(`[${gameId}] 预下载清单推演失败: payload 里没有 ${baseTag} 的差异`)
+    return null
+  }
+  const isUsm = p => typeof p === 'string' && p.toLowerCase().endsWith('.usm')
+  const files = { ...base }
+  let nAdd = 0
+  let nMod = 0
+  let nDel = 0
+  for (const e of entries.added ?? []) {
+    if (!isUsm(e.file))
+      continue
+    if (!files[e.file])
+      nAdd++
+    files[e.file] = { md5: e.md5 ?? '', size: e.size ?? 0 }
+  }
+  for (const e of entries.modified ?? []) {
+    if (!isUsm(e.file))
+      continue
+    nMod++
+    files[e.file] = { md5: e.md5 ?? '', size: e.size ?? 0 }
+  }
+  for (const e of entries.deleted ?? []) {
+    if (!isUsm(e.file))
+      continue
+    if (files[e.file]) {
+      delete files[e.file]
+      nDel++
+    }
+  }
+  log(`[${gameId}] 预下载清单推演 (基准 ${baseTag}): ${Object.keys(base).length} → ${Object.keys(files).length} 个 usm (新增 ${nAdd} · 修改 ${nMod} · 删除 ${nDel})`)
+  return { tag: baseTag, files }
+}
+
+/**
  * 更新 USM 文件历史: 对比「当前版本 vs 上一个版本」的 pkg_version 清单,
  * 只处理最新一个版本之间的差异 (以前版本不动)。
+ *
+ * 预下载联动: 若本地有 `predownload/{game}.json` 且其 predownload_version 比最新已发布版本更新,
+ * 则「当前版本」取**预下载版本**(清单 = 基准版本清单 + 预下载差异推演), 对比基准 = 最新已发布版本。
+ * 依据: 预下载只是临时的, 正式版内容与其一致 ⇒ 新文件应立刻进历史, 不必等正式版发布。
  *
  * 规则 (与 GitHub orilights/pkg_version 的 usm/*_history.json 完全一致):
  *   - 新增 (当前有、上版本无): 新增条目 {filename, state: AVAILABLE, versions:[{当前, AVAILABLE, md5, size}]}
@@ -516,22 +578,43 @@ export function updateUsmHistory(gameId, dataDir, log = () => {}) {
   if (!fs.existsSync(gameDir))
     throw new Error(`没有 ${gameId} 的版本目录`)
 
-  // 找最新两个版本 (按 semver 排序)
+  // 已发布的版本目录 (按 semver 排序)
   const versions = fs.readdirSync(gameDir).filter(v => {
     const lp = path.join(gameDir, v, 'pkg_version')
     return fs.existsSync(lp) && /^\d+\.\d+\.\d+$/.test(v)
   }).sort(compareVersions)
 
-  if (versions.length < 2)
-    throw new Error(`需要至少 2 个版本才能对比 (当前: ${versions.join(', ')})`)
-  const version = versions.at(-1)
-  const prev = versions.at(-2)
-  log(`[${gameId}] USM 历史: 对比 ${prev} → ${version}`)
+  // 预下载版本优先：预下载只是临时的，正式版与其内容一致，
+  // 所以只要本地有预下载数据、且它比最新已发布版本更新，就把「最新版本」当成预下载版本，
+  // 让这些新文件当场进历史（对比基准 = 最新已发布版本）。
+  let version = null
+  let prev = null
+  let cur = null
+  let old = null
+  const pre = loadPredownloadPayload(gameId, dataDir)
+  const latest = versions.at(-1) ?? null
+  if (pre?.predownload_version && pre.predownload_version !== latest
+    && (!latest || compareVersions(pre.predownload_version, latest) > 0)) {
+    const synth = latest ? synthPredownloadList(dataDir, gameId, pre, log) : null
+    if (synth) {
+      version = pre.predownload_version
+      prev = latest
+      cur = synth.files
+      old = readUsmFilesFromList(dataDir, gameId, prev)
+      log(`[${gameId}] USM 历史: 对比 ${prev} → ${version} (预下载版本, 基准清单 ${synth.tag})`)
+    }
+  }
 
-  const cur = readUsmFilesFromList(dataDir, gameId, version)
-  const old = readUsmFilesFromList(dataDir, gameId, prev)
-  if (!cur)
-    throw new Error(`${version} 的 pkg_version 清单不存在`)
+  if (version == null) {
+    if (versions.length < 2)
+      throw new Error(`需要至少 2 个版本才能对比 (当前: ${versions.join(', ') || '无'})`)
+    version = versions.at(-1)
+    prev = versions.at(-2)
+    log(`[${gameId}] USM 历史: 对比 ${prev} → ${version}`)
+    cur = readUsmFilesFromList(dataDir, gameId, version)
+    if (!cur)
+      throw new Error(`${version} 的 pkg_version 清单不存在`)
+  }
   if (!old)
     throw new Error(`${prev} 的 pkg_version 清单不存在`)
 
@@ -729,11 +812,9 @@ export async function downloadPredownloadFiles(gameId, dataDir, { files = null, 
       onProgress?.({ processed, total, current: entry.file, kind: entry.kind, status: 'downloading' })
       log(`[${processed}/${total}] ${entry.kind === 'added' ? '新增' : '修改'}: ${entry.file}`)
 
-      const slice = await sliceEntry(entry)
       fs.mkdirSync(path.dirname(outPath), { recursive: true })
-      tmp = path.join(bundleCache, `slice_${processed}_${Date.now()}.bin`)
 
-      // 优先 chunk 直下 (与文件列表页相同, 无需本地客户端文件)
+      // 优先 chunk 直下 (与文件列表页相同, 无需本地客户端文件; 也不必下载 diff 切片)
       const chunkEntry = chunkIndex?.[entry.file]
       if (chunkEntry?.chunks?.length) {
         try {
@@ -754,6 +835,11 @@ export async function downloadPredownloadFiles(gameId, dataDir, { files = null, 
           log(`  chunk 直下失败, 回退 diff: ${err.message}`)
         }
       }
+
+      // 仅当 chunk 直下不可用/失败时才取 diff 切片
+      // (切片需整包下载, 大包在 60s 超时内下不完, 放在最后可避免拖死可直下的文件)
+      const slice = await sliceEntry(entry)
+      tmp = path.join(bundleCache, `slice_${processed}_${Date.now()}.bin`)
 
       if (entry.kind === 'added') {
         // 新文件: 尝试 zstd 直解, 否则 hpatchz(空源)
@@ -931,6 +1017,13 @@ export async function ensureChunkIndex(gameId, dataDir, version, log = () => {})
       package_id: creds.package_id,
       password: creds.password,
     })
+    // 官方 getBuild 只给「当前」构建，没有按版本回溯的接口。若拿回来的 tag 与请求
+    // 版本不符，说明这个版本官方已不再提供 chunk 清单 —— 必须在这里停下，
+    // 否则会把「最新版的文件清单」写成 `${gameId}_${version}.index.json`，
+    // 让这个版本的索引从此永久错标。
+    const tag = buildInfo.data?.tag
+    if (tag && tag !== version)
+      throw new Error(`官方仅提供最新构建 (${tag})，无法取得 ${version} 的 chunk 清单`)
     fs.mkdirSync(path.dirname(snapshotPath), { recursive: true })
     fs.writeFileSync(snapshotPath, JSON.stringify(buildInfo), 'utf-8')
   }
@@ -1308,6 +1401,165 @@ export async function usmBytesToMp4(usm, { game = '', file = '', dataDir = null,
   return mp4
 }
 
+async function findFfmpeg() {
+  const { spawn } = await import('node:child_process')
+  const candidates = [
+    process.env.FFMPEG_PATH,
+    'C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe',
+    'ffmpeg',
+  ].filter(Boolean)
+  for (const candidate of candidates) {
+    try {
+      await new Promise((resolve, reject) => {
+        const process = spawn(candidate, ['-version'], { stdio: 'ignore' })
+        process.once('error', reject)
+        process.once('exit', code => code === 0 ? resolve() : reject(new Error(`exit ${code}`)))
+      })
+      return candidate
+    }
+    catch {}
+  }
+  return null
+}
+
+function pcmToWav(pcm, sampleRate, channels) {
+  const dataSize = pcm.length * 2
+  const output = Buffer.alloc(44 + dataSize)
+  output.write('RIFF', 0)
+  output.writeUInt32LE(36 + dataSize, 4)
+  output.write('WAVE', 8)
+  output.write('fmt ', 12)
+  output.writeUInt32LE(16, 16)
+  output.writeUInt16LE(1, 20)
+  output.writeUInt16LE(channels, 22)
+  output.writeUInt32LE(sampleRate, 24)
+  output.writeUInt32LE(sampleRate * channels * 2, 28)
+  output.writeUInt16LE(channels * 2, 32)
+  output.writeUInt16LE(16, 34)
+  output.write('data', 36)
+  output.writeUInt32LE(dataSize, 40)
+  for (let i = 0; i < pcm.length; i++)
+    output.writeInt16LE(pcm[i], 44 + i * 2)
+  return new Uint8Array(output)
+}
+
+// 历史 67 的 HCA 音频使用旧 mask key 的低 56 位；不能套用 67_test 的 HCA key。
+function reunionHcaAudioKey(file, key) {
+  const base = path.basename(String(file ?? '').replace(/\\/g, '/')).toLowerCase()
+  return base === 'video_reunion_67.usm' && key.mode === 'mask' ? key.keyHex : ''
+}
+
+async function decodeAudioWav(usm, { game = '', file = '', dataDir = null, chIndex = 0, log = () => {} } = {}) {
+  const { parseUsmChunks, makeAudioMask, decryptAudio } = await importUsmDemux()
+  const chunks = parseUsmChunks(usm)
+  const audioChunks = chunks.filter(c => c.type === '@SFA' && c.chno === chIndex)
+  if (!audioChunks.length) {
+    log(`[usm] 未找到 chno=${chIndex} 音频`)
+    return null
+  }
+  const first = audioChunks[0].data
+  const isHca = first.length > 4 && (first[0] & 0x7f) === 0x48 && (first[1] & 0x7f) === 0x43
+  if (isHca) {
+    const key = resolveKeyEntry(findUsmKey(dataDir, game, file))
+    const audioKey = key.audioHex || reunionHcaAudioKey(file, key)
+    if (!audioKey)
+      throw new Error(`HCA 文件缺少音频 audioKey (keys.json 条目需含 audio 字段)`)
+    return await decodeHcaWavInNode(concatBytes(audioChunks.map(c => c.data)), audioKey, log)
+  }
+  const key = resolveKeyEntry(findUsmKey(dataDir, game, file))
+  const { decodeAdx } = await import(pathToFileURL(path.join(__dirname, '../src/utils/adx_decoder.ts')).href)
+  const mask = key.mode === 'mask' ? makeAudioMask(BigInt(`0x${key.keyHex}`)) : null
+  const parts = audioChunks.map(c => mask ? decryptAudio(c.data, mask) : c.data)
+  const audio = decodeAdx(concatBytes(parts))
+  return pcmToWav(audio.pcm, audio.sampleRate, audio.channels)
+}
+
+async function decodeAudioWavs(usm, { game = '', file = '', dataDir = null, chIndex = null, log = () => {} } = {}) {
+  const channels = chIndex == null ? [0, 1, 2, 3] : [chIndex]
+  const tracks = []
+  for (const channel of channels) {
+    try {
+      const wav = await decodeAudioWav(usm, { game, file, dataDir, chIndex: channel, log })
+      if (wav)
+        tracks.push({ channel, wav })
+    }
+    catch (e) {
+      if (chIndex != null)
+        throw e
+      log(`[usm] chno=${channel} 音频不可用: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+  if (!tracks.length)
+    throw new Error(chIndex == null ? '未找到可用 @SFA 音频' : `未找到 chno=${chIndex} 音频`)
+  return tracks
+}
+
+async function runFfmpeg(args, log) {
+  const ffmpeg = await findFfmpeg()
+  if (!ffmpeg)
+    throw new Error('未找到 ffmpeg (VP9 7.1 导出需要; 可用 FFMPEG_PATH 指定)')
+  const { spawn } = await import('node:child_process')
+  await new Promise((resolve, reject) => {
+    const process = spawn(ffmpeg, args, { stdio: ['ignore', 'ignore', 'pipe'] })
+    let stderr = ''
+    process.stderr.on('data', d => { stderr += d.toString() })
+    process.once('error', reject)
+    process.once('exit', code => {
+      if (code === 0)
+        resolve()
+      else
+        reject(new Error(`ffmpeg 失败 (exit ${code}): ${stderr.slice(-500)}`))
+    })
+  })
+  log(`[usm] ffmpeg 完成: ${args.at(-1)}`)
+}
+
+async function muxVp9WithFfmpeg(ivf, audio, container, { log = () => {} } = {}) {
+  const os = await import('node:os')
+  const stamp = `${Date.now()}_${Math.random().toString(16).slice(2)}`
+  const ivfPath = path.join(os.tmpdir(), `hoyo-files_${stamp}.ivf`)
+  const outputPath = path.join(os.tmpdir(), `hoyo-files_${stamp}.${container === 'webm' ? 'webm' : 'mkv'}`)
+  const tracks = (Array.isArray(audio) ? audio : audio ? [{ channel: 0, wav: audio }] : []).filter(track => track?.wav)
+  const wavPaths = tracks.map((_, index) => path.join(os.tmpdir(), `hoyo-files_${stamp}_${index}.wav`))
+  try {
+    fs.writeFileSync(ivfPath, Buffer.from(ivf))
+    const args = ['-y', '-i', ivfPath]
+    for (let index = 0; index < tracks.length; index++) {
+      fs.writeFileSync(wavPaths[index], Buffer.from(tracks[index].wav))
+      args.push('-i', wavPaths[index])
+    }
+    args.push('-map', '0:v:0')
+    for (let index = 0; index < tracks.length; index++)
+      args.push('-map', `${index + 1}:a:0`)
+    args.push('-c:v', 'copy')
+    if (tracks.length) {
+      args.push('-c:a', container === 'webm' ? 'libopus' : 'aac')
+      args.push('-b:a', container === 'webm' ? '128k' : '192k')
+      const languages = ['chi', 'eng', 'jpn', 'kor']
+      for (let index = 0; index < tracks.length; index++)
+        args.push(`-metadata:s:a:${index}`, `language=${languages[tracks[index].channel] ?? 'und'}`)
+    }
+    args.push(outputPath)
+    await runFfmpeg(args, log)
+    return new Uint8Array(fs.readFileSync(outputPath))
+  }
+  finally {
+    for (const filePath of [ivfPath, ...wavPaths, outputPath]) {
+      try { fs.unlinkSync(filePath) } catch {}
+    }
+  }
+}
+
+export async function usmBytesToWebm(usm, { game = '', file = '', dataDir = null, chIndex = null, includeAudio = true, log = () => {} } = {}) {
+  const { format, stream } = await prepareVideoStream(usm, { game, file, dataDir, log })
+  const keyMode = resolveKeyEntry(findUsmKey(dataDir, game, file)).mode
+  // 67_test 的历史回退源是旧 mask VP9；与 7.1 AES VP9 共用同一条服务器解密播放路径。
+  if (format !== 'vp9' || game !== 'hk4e' || (keyMode !== 'aes' && keyMode !== 'mask'))
+    throw new Error('WebM 导出仅支持原神 VP9 视频')
+  const audio = includeAudio ? await decodeAudioWavs(usm, { game, file, dataDir, chIndex, log }) : []
+  return await muxVp9WithFfmpeg(stream, audio, 'webm', { log })
+}
+
 /**
  * USM 字节 → MKV (H.264 视频 + 音频, 崩铁导出用):
  *   - 视频: 与 usmBytesToMp4 相同的解密/提取逻辑 (掩码 / 4.5 AES-CTR / 明文)
@@ -1317,16 +1569,22 @@ export async function usmBytesToMp4(usm, { game = '', file = '', dataDir = null,
  *   - 无音频/解密失败时抛错 (调用方降级为纯视频 WebM)
  * @param chIndex 音频通道下标 (0=第一语言...), 默认 0
  */
-export async function usmBytesToMkv(usm, { game = '', file = '', dataDir = null, chIndex = 0, log = () => {} } = {}) {
+export async function usmBytesToMkv(usm, { game = '', file = '', dataDir = null, chIndex = null, log = () => {} } = {}) {
   const { parseUsmChunks, makeAudioMask, decryptAudio } = await importUsmDemux()
   const h264Mod = await import(pathToFileURL(path.join(__dirname, '../src/utils/h264mux.ts')).href)
   const { splitAnnexBToFrames, parseSps, makeAvcC } = h264Mod
   const { muxMkv } = await import(pathToFileURL(path.join(__dirname, '../src/utils/mkvmux.ts')).href)
 
   // ---- 视频 ----
-  const { stream: video } = await prepareVideoStream(usm, { game, file, dataDir, log })
-  if (video[0] === 0x44 && video[1] === 0x4b && video[2] === 0x49 && video[3] === 0x46)
+  const { format, stream: video } = await prepareVideoStream(usm, { game, file, dataDir, log })
+  if (format === 'vp9') {
+    const keyMode = resolveKeyEntry(findUsmKey(dataDir, game, file)).mode
+    if (game === 'hk4e' && (keyMode === 'aes' || keyMode === 'mask')) {
+      const audio = await decodeAudioWavs(usm, { game, file, dataDir, chIndex, log })
+      return await muxVp9WithFfmpeg(video, audio, 'mkv', { log })
+    }
     throw new Error('VP9 视频请使用流式播放')
+  }
   if (video[0] === 0 && video[1] === 0 && video[2] === 1 && video[3] === 0xb3)
     throw new Error('MPEG1 视频请使用 MP4 转码导出')
   if (!(video[0] === 0 && video[1] === 0 && video[2] === 0 && video[3] === 1))
@@ -1370,9 +1628,10 @@ export async function usmBytesToMkv(usm, { game = '', file = '', dataDir = null,
 
   // ---- 音频: @SFA 按 chno 汇总, ADX / HCA 双格式 ----
   const chunks = parseUsmChunks(usm)
-  const audioChunks = chunks.filter(c => c.type === '@SFA' && c.chno === chIndex)
+  const audioChannel = chIndex ?? 0
+  const audioChunks = chunks.filter(c => c.type === '@SFA' && c.chno === audioChannel)
   if (!audioChunks.length)
-    throw new Error(`未找到 chno=${chIndex} 的 @SFA 音频块`)
+    throw new Error(`未找到 chno=${audioChannel} 的 @SFA 音频块`)
   const firstA = audioChunks[0].data
   const isHca = firstA.length > 4 && (firstA[0] & 0x7f) === 0x48 && (firstA[1] & 0x7f) === 0x43
 
@@ -1385,7 +1644,7 @@ export async function usmBytesToMkv(usm, { game = '', file = '', dataDir = null,
     const hca = concatBytes(audioChunks.map(c => c.data))
     const wav = await decodeHcaWavInNode(hca, key.audioHex, log)
     audio = parseWavPcm(wav)
-    log(`[usm] 音频(HCA) chno=${chIndex}: ${audio.channels}ch ${audio.sampleRate}Hz ${(audio.totalSamples / audio.sampleRate).toFixed(2)}s`)
+    log(`[usm] 音频(HCA) chno=${audioChannel}: ${audio.channels}ch ${audio.sampleRate}Hz ${(audio.totalSamples / audio.sampleRate).toFixed(2)}s`)
   }
   else {
     // ADX: 4.4 加密文件用视频 key 派生的音频掩码; 4.5 明文文件 (对象 key/全零) 不解密
@@ -1395,7 +1654,7 @@ export async function usmBytesToMkv(usm, { game = '', file = '', dataDir = null,
     const audioParts = audioChunks.map(c => audioMask ? decryptAudio(c.data, audioMask) : c.data)
     const adx = concatBytes(audioParts)
     audio = decodeAdx(adx)
-    log(`[usm] 音频(ADX) chno=${chIndex}: ${audio.channels}ch ${audio.sampleRate}Hz ${(audio.totalSamples / audio.sampleRate).toFixed(2)}s`)
+    log(`[usm] 音频(ADX) chno=${audioChannel}: ${audio.channels}ch ${audio.sampleRate}Hz ${(audio.totalSamples / audio.sampleRate).toFixed(2)}s`)
   }
 
   // ---- MKV 封装 ----

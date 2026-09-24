@@ -108,9 +108,10 @@ function interleave(planar: Int16Array, channels: number, totalSamples: number, 
  * @param usm 完整 USM 字节
  * @param chno 音频通道号 (0=第一语言, 1=第二语言, ...)
  * @param keyHex 16 位 hex key (全零=不加密)
+ * @param decrypt 是否应用 ADX mask；HCA 原始流必须传 false
  * @returns ADX 字节流 (可直接传给 decodeAdx)
  */
-export async function extractAdxFromUsm(usm: Uint8Array, chno: number, keyHex: string): Promise<Uint8Array> {
+export async function extractAdxFromUsm(usm: Uint8Array, chno: number, keyHex: string, decrypt = true): Promise<Uint8Array> {
   const { parseUsmChunks, makeAudioMask, decryptAudio } = await import('./usm_demux.ts')
 
   const chunks = parseUsmChunks(usm)
@@ -121,7 +122,7 @@ export async function extractAdxFromUsm(usm: Uint8Array, chno: number, keyHex: s
     throw new Error(`未找到 chno=${chno} 的 @SFA 音频块`)
 
   // 加密时解密音频 (非零 key)
-  const needDecrypt = keyHex && keyHex !== '0000000000000000'
+  const needDecrypt = decrypt && keyHex && keyHex !== '0000000000000000'
   const audioMask = needDecrypt ? makeAudioMask(BigInt(`0x${keyHex}`)) : null
 
   const processed = audioMask

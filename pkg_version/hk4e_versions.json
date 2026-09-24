@@ -5248,5 +5248,21 @@
       "password": "CW8GbLNU8f",
       "tag": "7.0.0"
     }
+  },
+  "7.1.0": {
+    "game": {},
+    "voice": {},
+    "update": {},
+    "decompressed_path": null,
+    "chunk": {
+      "branch": "main",
+      "diff_tags": [
+        "7.0.0",
+        "6.7.0"
+      ],
+      "package_id": "8xfMve0uwQ",
+      "password": "CW8GbLNU8f",
+      "tag": "7.1.0"
+    }
   }
 }

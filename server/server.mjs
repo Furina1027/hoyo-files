@@ -17,7 +17,7 @@ import path from 'node:path'
 import zlib from 'node:zlib'
 import { fileURLToPath } from 'node:url'
 
-import { assembleUsmFromChunks, detectUsmBytes, detectUsmFormat, downloadPredownloadFiles, gameStatus, predownloadChunkInfo, predownloadDir, predownloadSummary, refreshGame, updateUsmHistory, usmBytesToMkv, usmBytesToMp4, usmToMp4 } from './refresh.mjs'
+import { assembleUsmFromChunks, detectUsmBytes, detectUsmFormat, downloadPredownloadFiles, gameStatus, predownloadChunkInfo, predownloadDir, predownloadSummary, refreshGame, updateUsmHistory, usmBytesToMkv, usmBytesToMp4, usmBytesToWebm, usmToMp4 } from './refresh.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -50,6 +50,40 @@ const GAME_NAMES = {
   hk4e: '原神',
   nap: '绝区零',
 }
+
+// 67_test 在 7.1 已无法正常播放，但资源结构与历史 67 相同。
+// 前端继续显示/请求原文件名；后端静默改取历史 67，前端不暴露这个替换。
+const USM_BACKEND_ALIASES = {
+  hk4e: {
+    'video_reunion_67_test.usm': {
+      file: 'Video_Reunion_67.usm',
+      version: '6.7.0',
+      fallbackFile: 'YuanShen_Data/StreamingAssets/VideoAssets/StandaloneWindows64/Video_Reunion_67.usm',
+    },
+  },
+}
+
+function resolveUsmBackendRequest(game, file, version = '') {
+  const original = String(file ?? '')
+  const normalized = original.replace(/\\/g, '/')
+  const base = normalized.slice(normalized.lastIndexOf('/') + 1).toLowerCase()
+  const alias = USM_BACKEND_ALIASES[game]?.[base]
+  if (!alias)
+    return { file: original, version, aliased: false }
+
+  const marker = '/StandaloneWindows64/'
+  const markerIndex = normalized.lastIndexOf(marker)
+  let aliasedFile
+  if (markerIndex !== -1)
+    aliasedFile = `${normalized.slice(0, markerIndex + marker.length)}${alias.file}`
+  else if (normalized.includes('/'))
+    aliasedFile = `${normalized.slice(0, normalized.lastIndexOf('/') + 1)}${alias.file}`
+  else
+    aliasedFile = alias.fallbackFile
+
+  return { file: aliasedFile, version: alias.version || version, aliased: true }
+}
+
 /**
  * 从请求的 file 里剥出「相对视频根」的路径，用于同根内精确命中。
  * 例: ZenlessZoneZero_Data/StreamingAssets/Video/HD/Yorozuya/Skyscraper/X.usm + 视频根
@@ -69,65 +103,134 @@ function relWithinVideoRoots(file, dirs) {
   return null
 }
 
-function fetchLocalUsm(game, file, log = () => {}, customRoot = null) {
+/**
+ * 本地视频根目录的 USM 索引缓存: rootDir -> { at, byName, byLower }。
+ * 递归兜底（绝区零等分层目录）改为先建一次索引，避免「每个文件都遍历整棵树」。
+ * 用短 TTL 而非永久缓存，游戏热更/删除文件后最多 30 秒自行失效。
+ */
+const LOCAL_DIR_INDEX_TTL = 30_000
+const localDirIndexCache = new Map()
+
+function localDirIndex(rootDir) {
+  const now = Date.now()
+  const hit = localDirIndexCache.get(rootDir)
+  if (hit && now - hit.at < LOCAL_DIR_INDEX_TTL)
+    return hit
+
+  const byName = new Map()
+  const byLower = new Map()
+  const stack = [rootDir]
+  let scanned = 0
+  while (stack.length && scanned < 200_000) {
+    const cur = stack.pop()
+    let entries
+    try {
+      entries = fs.readdirSync(cur, { withFileTypes: true })
+    }
+    catch { continue }
+    for (const e of entries) {
+      scanned++
+      const cp = path.join(cur, e.name)
+      if (e.isDirectory()) {
+        stack.push(cp)
+      }
+      else if (e.name.toLowerCase().endsWith('.usm')) {
+        const nameHits = byName.get(e.name)
+        if (nameHits)
+          nameHits.push(cp)
+        else
+          byName.set(e.name, [cp])
+
+        const low = e.name.toLowerCase()
+        const lowHits = byLower.get(low)
+        if (lowHits)
+          lowHits.push(cp)
+        else
+          byLower.set(low, [cp])
+      }
+    }
+  }
+
+  const entry = { at: now, byName, byLower }
+  localDirIndexCache.set(rootDir, entry)
+  return entry
+}
+
+/** 视频根属于哪一类（用于日志与前端展示本地来源） */
+function localRootKind(sub) {
+  return String(sub).includes('Persistent') ? 'Persistent' : 'StreamingAssets'
+}
+
+/**
+ * 定位本地游戏里的 USM 文件 —— 只探测存在性，不读字节
+ * （批量探测数百个文件时，读盘代价不可接受）。
+ *
+ * 顺序与取字节时完全一致：视频根按目录表顺序（Persistent 热更 → StreamingAssets），
+ * 根内先按请求路径精确命中（同名文件很多，只认文件名会拿错那一份），
+ * 再按文件名直查，最后递归兜底（路径尾部一致的那一份优先）。
+ *
+ * 返回 { path, root, kind, how } 或 null。
+ */
+function locateLocalUsm(game, file, customRoot = null) {
   const root = customRoot || GAME_DIRS[game]
   const dirs = GAME_VIDEO_DIRS[game]
-  if (!root || !dirs) return null
-  const base = path.basename(String(file).replace(/\\/g, '/'))
-  if (!base.toLowerCase().endsWith('.usm')) return null
-  const rel = relWithinVideoRoots(file, dirs)
+  if (!root || !dirs)
+    return null
+  const norm = String(file).replace(/\\/g, '/')
+  const base = path.basename(norm)
+  if (!base.toLowerCase().endsWith('.usm'))
+    return null
+  const rel = relWithinVideoRoots(norm, dirs)
   const relLow = rel ? rel.toLowerCase() : null
-  const readAt = (p, how) => {
-    const buf = fs.readFileSync(p)
-    log(`[usm] 使用本地游戏文件${how}: ${p} (${buf.length} 字节)`)
-    return new Uint8Array(buf)
-  }
-  // 1) 按请求里的目录精确命中（同名文件很多，只认文件名会拿错那一份）。
-  //    注意根的顺序仍是 Persistent → StreamingAssets，热更优先级不变。
+  const hit = (p, sub, how) => ({ path: p, root: sub, kind: localRootKind(sub), how })
+
+  // 1) 按请求里的目录精确命中
   if (rel) {
     for (const sub of dirs) {
       const p = path.join(root, sub, rel)
       try {
         if (fs.existsSync(p))
-          return readAt(p, '')
+          return hit(p, sub, '')
       } catch { /* 忽略 */ }
     }
   }
+  // 2) 根内按文件名直查
   for (const sub of dirs) {
     const p = path.join(root, sub, base)
     try {
       if (fs.existsSync(p))
-        return readAt(p, '')
+        return hit(p, sub, '')
     } catch { /* 忽略 */ }
   }
-  // 绝区零等分层的目录: 基名直查未命中时做受限递归搜索
-  // （同一根内若存在与请求路径尾部完全一致的那一份，优先取它；否则退回第一个同名命中）
+  // 3) 递归兜底（分层目录）
   for (const sub of dirs) {
     const rootDir = path.join(root, sub)
     try {
-      if (!fs.existsSync(rootDir)) continue
-      let fallback = null
-      const stack = [rootDir]
-      while (stack.length) {
-        const cur = stack.pop()
-        for (const e of fs.readdirSync(cur, { withFileTypes: true })) {
-          const cp = path.join(cur, e.name)
-          if (e.isDirectory()) {
-            if (stack.length < 32) stack.push(cp)
-          } else if (e.name === base) {
-            if (!relLow)
-              return readAt(cp, '(递归)')
-            if (cp.replace(/\\/g, '/').toLowerCase().endsWith(`/${relLow}`))
-              return readAt(cp, '(递归/精确路径)')
-            if (!fallback) fallback = cp
-          }
-        }
-      }
-      if (fallback)
-        return readAt(fallback, '(递归)')
-    } catch { /* 忽略 */ }
+      if (!fs.existsSync(rootDir))
+        continue
+    }
+    catch { continue }
+    const { byName, byLower } = localDirIndex(rootDir)
+    const hits = byName.get(base) ?? byLower.get(base.toLowerCase()) ?? []
+    if (!hits.length)
+      continue
+    if (relLow) {
+      const exact = hits.find(p => p.replace(/\\/g, '/').toLowerCase().endsWith(`/${relLow}`))
+      if (exact)
+        return hit(exact, sub, '(递归/精确路径)')
+    }
+    return hit(hits[0], sub, '(递归)')
   }
   return null
+}
+
+function fetchLocalUsm(game, file, log = () => {}, customRoot = null) {
+  const found = locateLocalUsm(game, file, customRoot)
+  if (!found)
+    return null
+  const buf = fs.readFileSync(found.path)
+  log(`[usm] 使用本地游戏文件${found.how} (${found.kind}): ${found.path} (${buf.length} 字节)`)
+  return new Uint8Array(buf)
 }
 
 const MIME = {
@@ -165,12 +268,53 @@ const server = http.createServer(async (req, res) => {
     })
   }
 
+  // ---- API: 批量探测本地游戏文件 (CDN 已下架时, 前端据此判断还能否播放/导出) ----
+  // 只回「在不在 + 在哪」，不读字节：一次请求几百个路径也只做存在性检查。
+  if (url.pathname === '/api/usm-local-files' && req.method === 'POST') {
+    let body = {}
+    try {
+      body = JSON.parse((await readBody(req)) || '{}')
+    }
+    catch { /* 非法 body 视为空 */ }
+    const game = body.game ?? ''
+    const gameDir = body.game_dir ?? null
+    const files = Array.isArray(body.files) ? body.files : []
+    try {
+      const found = {}
+      for (const f of files) {
+        if (typeof f !== 'string' || !f)
+          continue
+        const request = resolveUsmBackendRequest(game, f, '')
+        let hit = locateLocalUsm(game, request.file, gameDir)
+        if (!hit && request.aliased)
+          hit = locateLocalUsm(game, f, gameDir)
+        if (!hit)
+          continue
+        let size = null
+        try {
+          size = fs.statSync(hit.path).size
+        }
+        catch { /* 忽略 */ }
+        found[f] = { path: hit.path, source: hit.kind, how: hit.how, size }
+      }
+      tlog(`[usm-local] ${game}: 命中本地 ${Object.keys(found).length}/${files.length}`)
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({ game, game_dir: gameDir ?? GAME_DIRS[game] ?? null, found }))
+    }
+    catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({ error: err.message }))
+    }
+    return
+  }
+
   // ---- API: USM 格式探测 (直链失败自动回退 chunk 组装; 避开浏览器外网/大响应限制) ----
   if (url.pathname === '/api/usm-detect' && req.method === 'GET') {
-    const target = url.searchParams.get('url') ?? ''
     const game = url.searchParams.get('game') ?? ''
-    const file = url.searchParams.get('file') ?? ''
-    const version = url.searchParams.get('version') ?? ''
+    const request = resolveUsmBackendRequest(game, url.searchParams.get('file') ?? '', url.searchParams.get('version') ?? '')
+    const file = request.file
+    const version = request.version
+    const target = request.aliased ? '' : url.searchParams.get('url') ?? ''
     const gameDir = url.searchParams.get('game_dir') ?? null
     try {
       let format = null
@@ -186,7 +330,10 @@ const server = http.createServer(async (req, res) => {
           console.log(`[usm-detect] 直链失败, 回退 chunk: ${err.message}`)
         }
       }
-      if (!format && game && file) {
+      // 无版本号时不做 chunk 回退：assembleUsmFromChunks 会退到「最新版本」，
+      // 而最新版本的清单必然不含已下架文件，白付一次 chunk 索引构建的代价。
+      // 本地文件已在上面命中，这里只处理「浏览器直链挂了但知道目标版本」的情况。
+      if (!format && version && game && file) {
         const usm = await assembleUsmFromChunks(game, file, { version, dataDir: DATA_ROOT, log: msg => tlog(msg) })
         format = await detectUsmBytes(usm, { game, file, dataDir: DATA_ROOT, log: msg => tlog(msg) })
       }
@@ -203,10 +350,11 @@ const server = http.createServer(async (req, res) => {
   // ---- API: USM → MP4 输出 (浏览器 <video> 直接加载; 直链失败自动回退 chunk 组装) ----
   if (url.pathname === '/api/usm-mp4' && req.method === 'GET') {
     const game = url.searchParams.get('game') ?? ''
-    const file = url.searchParams.get('file') ?? ''
-    const version = url.searchParams.get('version') ?? ''
+    const request = resolveUsmBackendRequest(game, url.searchParams.get('file') ?? '', url.searchParams.get('version') ?? '')
+    const file = request.file
+    const version = request.version
     const gameDir = url.searchParams.get('game_dir') ?? null
-    let target = url.searchParams.get('url') ?? ''
+    let target = request.aliased ? '' : url.searchParams.get('url') ?? ''
     // 支持按 游戏+文件+版本 拼直链 (兼容旧调用)
     if (!target && version) {
       try {
@@ -254,11 +402,14 @@ const server = http.createServer(async (req, res) => {
   // ---- API: USM → MKV 输出 (H.264 视频 + ADX 音频, 崩铁导出用; 直链失败自动回退 chunk 组装) ----
   if (url.pathname === '/api/usm-mkv' && req.method === 'GET') {
     const game = url.searchParams.get('game') ?? ''
-    const file = url.searchParams.get('file') ?? ''
-    const version = url.searchParams.get('version') ?? ''
-    const chIndex = Number(url.searchParams.get('ch') ?? '0') || 0
+    const request = resolveUsmBackendRequest(game, url.searchParams.get('file') ?? '', url.searchParams.get('version') ?? '')
+    const file = request.file
+    const version = request.version
+    const rawCh = url.searchParams.get('ch')
+    const parsedCh = rawCh == null || rawCh === '' ? null : Number(rawCh)
+    const chIndex = Number.isInteger(parsedCh) && parsedCh >= 0 ? parsedCh : null
     const gameDir = url.searchParams.get('game_dir') ?? null
-    let target = url.searchParams.get('url') ?? ''
+    let target = request.aliased ? '' : url.searchParams.get('url') ?? ''
     if (!target && version) {
       try {
         const versions = JSON.parse(fs.readFileSync(path.join(DATA_ROOT, `${game}_versions.json`), 'utf-8'))
@@ -310,12 +461,70 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
+  if (url.pathname === '/api/usm-webm' && req.method === 'GET') {
+    const game = url.searchParams.get('game') ?? ''
+    const request = resolveUsmBackendRequest(game, url.searchParams.get('file') ?? '', url.searchParams.get('version') ?? '')
+    const file = request.file
+    const version = request.version
+    const rawCh = url.searchParams.get('ch')
+    const parsedCh = rawCh == null || rawCh === '' ? null : Number(rawCh)
+    const chIndex = Number.isInteger(parsedCh) && parsedCh >= 0 ? parsedCh : null
+    const includeAudio = url.searchParams.get('audio') !== '0'
+    const gameDir = url.searchParams.get('game_dir') ?? null
+    let target = request.aliased ? '' : url.searchParams.get('url') ?? ''
+    if (!target && version) {
+      try {
+        const versions = JSON.parse(fs.readFileSync(path.join(DATA_ROOT, `${game}_versions.json`), 'utf-8'))
+        const base = versions[version]?.decompressed_path
+        if (base)
+          target = `${base.replace(/\/+$/, '')}/${file}`
+      }
+      catch {}
+    }
+    try {
+      let webm = null
+      const localUsm = fetchLocalUsm(game, file, msg => tlog(msg), gameDir)
+      if (localUsm)
+        webm = await usmBytesToWebm(localUsm, { game, file, dataDir: DATA_ROOT, chIndex, includeAudio, log: msg => tlog(msg) })
+      if (!webm && target) {
+        try {
+          const res0 = await fetch(target, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36' },
+            signal: AbortSignal.timeout(300_000),
+          })
+          if (res0.ok)
+            webm = await usmBytesToWebm(new Uint8Array(await res0.arrayBuffer()), { game, file, dataDir: DATA_ROOT, chIndex, includeAudio, log: msg => tlog(msg) })
+        }
+        catch (err) {
+          console.log(`[usm-webm] 直链失败, 回退 chunk: ${err.message}`)
+        }
+      }
+      if (!webm) {
+        const usm = await assembleUsmFromChunks(game, file, { version, dataDir: DATA_ROOT, log: msg => tlog(msg) })
+        webm = await usmBytesToWebm(usm, { game, file, dataDir: DATA_ROOT, chIndex, includeAudio, log: msg => tlog(msg) })
+      }
+      res.writeHead(200, {
+        'Content-Type': 'video/webm',
+        'Content-Length': webm.length,
+        'Cache-Control': 'no-cache',
+        'Accept-Ranges': 'bytes',
+      })
+      res.end(Buffer.from(webm), () => tlog('[api] usm-webm 响应已发送', ((Date.now() - t0) / 1000).toFixed(2) + 's'))
+    }
+    catch (err) {
+      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' })
+      res.end(`USM 转换失败: ${err.message}`)
+    }
+    return
+  }
+
   // ---- API: USM 原始文件代理 (VP9 流式解码由浏览器 fetch 全量 USM; 直链失败自动回退 chunk 组装) ----
   if (url.pathname === '/api/usm-proxy' && req.method === 'GET') {
     const game = url.searchParams.get('game') ?? ''
-    const file = url.searchParams.get('file') ?? ''
-    const version = url.searchParams.get('version') ?? ''
-    const target = url.searchParams.get('url') ?? ''
+    const request = resolveUsmBackendRequest(game, url.searchParams.get('file') ?? '', url.searchParams.get('version') ?? '')
+    const file = request.file
+    const version = request.version
+    const target = request.aliased ? '' : url.searchParams.get('url') ?? ''
     const gameDir = url.searchParams.get('game_dir') ?? null
     const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36'
     try {

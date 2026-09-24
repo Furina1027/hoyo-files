@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import type { ChunkManifest, ParsedChunk } from '@/types'
+import type { UsmKeyEntry } from '@/utils/usm_demux'
 import { API_BASE, AUDIO_LANG_LABELS, GameList } from '@/constants/core'
 import { useSettings } from '@/store/settings'
+import { decodeAdx, extractAdxFromUsm } from '@/utils/adx_decoder'
 import { downloadChunks } from '@/utils/chunk'
 import { fetchAndParseManifest } from '@/utils/manifest'
 import { decodeHcaToWav, getUsmStreamDecoder, parseWavPcm } from '@/utils/usm'
-import type { UsmKeyEntry } from '@/utils/usm_demux'
 import { parseUsmChunks } from '@/utils/usm_demux'
-import { decodeAdx, extractAdxFromUsm } from '@/utils/adx_decoder'
 
 interface Props {
   filename: string
@@ -16,6 +16,14 @@ interface Props {
   bestChunkVersion: string | null
   gameId: string
   filePath: string
+  /**
+   * 本地游戏目录里已确认存在该文件（官方 CDN 已下架的情况）。
+   * 此时 directDownloadUrl / bestChunkVersion 都会是 null，
+   * 但服务器仍可从本地游戏文件取字节，仍需做一次格式探测以选对播放通路。
+   */
+  localAvailable?: boolean
+  /** 后端静默使用历史同源文件时，仍由前端保留原文件名显示。 */
+  serverAlias?: boolean
 }
 
 const props = defineProps<Props>()
@@ -54,7 +62,10 @@ let audioSource: AudioBufferSourceNode | null = null
 /** 掩码 key (4.4 字符串条目); 4.5 method2 对象条目的音频不走掩码 → 传全零 */
 const maskKeyHex = typeof props.keyEntry === 'string' ? props.keyEntry : '0000000000000000'
 /** 4.5 method2 的 HCA 音频 keycode (对象条目才有) */
-const hcaAudioKeyHex = (typeof props.keyEntry === 'object' && props.keyEntry?.audio) ? props.keyEntry.audio : ''
+// 67_test 的 key 条目只负责让历史列表显示可播放；音频沿用历史 67 的旧 key。
+const hcaAudioKeyHex = (typeof props.keyEntry === 'object' && props.keyEntry?.audio)
+  ? props.keyEntry.audio
+  : props.serverAlias ? maskKeyHex : ''
 
 const settings = useSettings()
 
@@ -479,11 +490,12 @@ async function loadAdxAudio(usmBytes: Uint8Array, signal: AbortSignal) {
       let channels: number
       // 4.5 method2 剧情视频的 @SFA 是 HCA (magic 最高位混淆), 其余为 ADX
       const head = firstAudioChunkHead(usmBytes, chno)
-      const isHca = head.length > 1 && (head[0] & 0x7f) === 0x48 && (head[1] & 0x7f) === 0x43
+      const isHca = head.length > 1 && (head[0] & 0x7F) === 0x48 && (head[1] & 0x7F) === 0x43
       if (isHca) {
         if (!hcaAudioKeyHex)
           throw new Error('缺少 audioKey')
-        const hca = await extractAdxFromUsm(usmBytes, chno, maskKeyHex)
+        // HCA 不经过 ADX mask；历史 67 直接把原始 HCA 字节交给 HCA 解码器。
+        const hca = await extractAdxFromUsm(usmBytes, chno, '', false)
         const wav = await decodeHcaToWav(hca, hcaAudioKeyHex)
         ;({ pcm, sampleRate, channels } = parseWavPcm(wav))
       }
@@ -502,7 +514,7 @@ async function loadAdxAudio(usmBytes: Uint8Array, signal: AbortSignal) {
       if (!audioChannelList.value.includes(chno))
         audioChannelList.value.push(chno)
     }
-    catch (e) {
+    catch {
       // 某些 chno 可能不存在, 忽略
     }
   }
@@ -554,6 +566,10 @@ async function startStreaming() {
       await playH264()
       return
     }
+    if (fmt === 'vp9' && props.gameId === 'hk4e' && (typeof props.keyEntry === 'object' || props.serverAlias)) {
+      await playServerVp9()
+      return
+    }
   }
   catch {
     // 探测失败回退 VP9 流式
@@ -562,17 +578,17 @@ async function startStreaming() {
 }
 
 /** 探测 USM 视频格式 (检查流 chunk 数据 magic) */
-function detectVideoFormat(buf: Uint8Array): 'vp9' | 'h264' | null {
+function detectVideoFormat(buf: Uint8Array): 'vp9' | 'h264' | 'mpeg1' | null {
   let checked = 0
   for (const c of parseUsmChunks(buf)) {
     if (c.data.length < 8)
       continue
     const d = c.data
-    if (d[0] === 0x44 && d[1] === 0x4b && d[2] === 0x49 && d[3] === 0x46)
+    if (d[0] === 0x44 && d[1] === 0x4B && d[2] === 0x49 && d[3] === 0x46)
       return 'vp9' // DKIF (IVF)
     if (d[0] === 0 && d[1] === 0 && d[2] === 0 && d[3] === 1)
       return 'h264' // 00000001 (Annex-B)
-    if (d[0] === 0 && d[1] === 0 && d[2] === 1 && d[3] === 0xb3)
+    if (d[0] === 0 && d[1] === 0 && d[2] === 1 && d[3] === 0xB3)
       return 'mpeg1' // 000001B3 (MPEG-1 ES)
     if (++checked >= 4)
       break
@@ -580,9 +596,10 @@ function detectVideoFormat(buf: Uint8Array): 'vp9' | 'h264' | null {
   return null
 }
 
-async function probeVideoFormat(): Promise<'vp9' | 'h264' | null> {
-  // 通过数据服务器探测 (服务器无浏览器网络/大响应限制; 加密文件用 key 解密后判断; 直链失败自动回退 chunk)
-  if (props.directDownloadUrl || props.bestChunkVersion) {
+async function probeVideoFormat(): Promise<'vp9' | 'h264' | 'mpeg1' | null> {
+  // 通过数据服务器探测 (服务器无浏览器网络/大响应限制; 加密文件用 key 解密后判断;
+  // 本地游戏文件优先, 直链失败自动回退 chunk)
+  if (props.directDownloadUrl || props.bestChunkVersion || props.localAvailable) {
     try {
       const params = new URLSearchParams({ game: props.gameId, file: props.filePath })
       const gameDir = getGameDir(props.gameId)
@@ -640,10 +657,85 @@ async function fetchFirstChunk(): Promise<Uint8Array | null> {
       const { ZSTDDecoder } = await import('zstddec')
       const dec = new ZSTDDecoder()
       await dec.init()
-      return dec.decode(compressed, Number(c.uncompressed_size))
+      return dec.decode(compressed, Number(c.uncompressedSize))
     }
   }
   return null
+}
+
+async function playServerVp9() {
+  if (!videoRef.value)
+    return
+  phase.value = 'buffering'
+  progress.value = 0
+  progressLabel.value = '服务器解密 VP9...'
+  audioStatusText.value = ''
+  audioChannelList.value = []
+  abortController = new AbortController()
+  const { signal } = abortController
+  try {
+    const params = new URLSearchParams()
+    params.set('game', props.gameId)
+    params.set('file', props.filePath)
+    const gameDir = getGameDir(props.gameId)
+    if (gameDir)
+      params.set('game_dir', gameDir)
+    if (props.directDownloadUrl)
+      params.set('url', props.directDownloadUrl)
+    if (props.bestChunkVersion)
+      params.set('version', props.bestChunkVersion)
+    params.set('audio', '0')
+    const res = await fetch(`${API_BASE}/api/usm-webm?${params}`, { signal })
+    if (!res.ok) {
+      const text = await res.text().catch(() => '')
+      throw new Error(text.replace(/^USM 转换失败:\s*/, '') || `HTTP ${res.status}`)
+    }
+    const total = Number(res.headers.get('Content-Length') ?? 0)
+    const reader = res.body!.getReader()
+    const parts: Uint8Array[] = []
+    let received = 0
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done)
+        break
+      if (signal.aborted)
+        return
+      parts.push(value)
+      received += value.byteLength
+      if (total > 0)
+        progress.value = Math.min(99, Math.round((received / total) * 99))
+    }
+    objectUrl = URL.createObjectURL(new Blob(parts as BlobPart[], { type: 'video/webm' }))
+    videoRef.value.src = objectUrl
+    await videoRef.value.play().catch(() => {})
+    try {
+      audioStatusText.value = '四音轨加载中...'
+      const usmBytes = await fetchUsmBytes(signal)
+      if (signal.aborted)
+        return
+      await loadAdxAudio(usmBytes, signal)
+      if (signal.aborted)
+        return
+      if (audioChannelList.value.length === 0)
+        audioStatusText.value = '未找到可用音轨'
+      else if (audioStatusText.value === '四音轨加载中...')
+        audioStatusText.value = `已加载 ${audioChannelList.value.length} 条音轨`
+    }
+    catch (e) {
+      if ((e as Error).name === 'AbortError')
+        return
+      audioStatusText.value = '音频加载失败'
+    }
+    phase.value = 'playing'
+    progress.value = 100
+    progressLabel.value = '加载完成'
+  }
+  catch (e) {
+    if ((e as Error).name === 'AbortError')
+      return
+    phase.value = 'error'
+    errorMsg.value = (e as Error).message || String(e)
+  }
 }
 
 /** H.264 路径: 服务器转 MP4 → 浏览器 fetch 下载 (带进度) → Blob URL 播放 (避开 video 直连加载的卡顿) */
@@ -702,7 +794,7 @@ async function playH264() {
       }
     }
 
-    objectUrl = URL.createObjectURL(new Blob(parts, { type: 'video/mp4' }))
+    objectUrl = URL.createObjectURL(new Blob(parts as BlobPart[], { type: 'video/mp4' }))
     videoRef.value.src = objectUrl
     await videoRef.value.play().catch(() => {})
 
@@ -731,60 +823,6 @@ async function playH264() {
     phase.value = 'error'
     errorMsg.value = (e as Error).message || String(e)
   }
-}
-
-/** 完整下载 USM (直链或 chunk 拼接) */
-async function fetchFullUsm(signal: AbortSignal): Promise<Uint8Array> {
-  if (props.directDownloadUrl) {
-    const res = await fetch(props.directDownloadUrl, { signal })
-    if (!res.ok)
-      throw new Error(`下载失败：HTTP ${res.status}`)
-    return new Uint8Array(await res.arrayBuffer())
-  }
-  if (props.bestChunkVersion) {
-    const res = await fetch(`${API_BASE}/chunk/${props.gameId}_${props.bestChunkVersion}.json`, { signal })
-    if (!res.ok)
-      throw new Error(`Chunk 列表获取失败：HTTP ${res.status}`)
-    const json = await res.json()
-    const manifests: ChunkManifest[] = json.data?.manifests ?? []
-    let chunkUrlPrefix = ''
-    let foundFile: { chunks: ParsedChunk[] } | null = null
-    for (const m of manifests) {
-      if (signal.aborted)
-        throw new DOMException('aborted', 'AbortError')
-      const cacheKey = `${props.gameId}_${props.bestChunkVersion}_${m.manifest.id}`
-      const url = `${m.manifest_download.url_prefix}/${m.manifest.id}`
-      let parsed
-      try {
-        parsed = await fetchAndParseManifest(url, cacheKey, Number(m.manifest.uncompressed_size), signal)
-      }
-      catch (e) {
-        if ((e as Error).name === 'AbortError' || e instanceof TypeError)
-          throw e
-        continue
-      }
-      const match = parsed.files.find(f => f.path === props.filePath)
-      if (match) {
-        foundFile = match
-        chunkUrlPrefix = m.chunk_download.url_prefix
-        break
-      }
-    }
-    if (!foundFile)
-      throw new Error('无可用资源')
-    const chunks = [...foundFile.chunks].sort((a, b) => a.offset - b.offset)
-    const parts: Uint8Array[] = []
-    await downloadChunks(chunks, chunkUrlPrefix, signal, d => parts.push(d))
-    const total = parts.reduce((s, p) => s + p.length, 0)
-    const out = new Uint8Array(total)
-    let off = 0
-    for (const p of parts) {
-      out.set(p, off)
-      off += p.length
-    }
-    return out
-  }
-  throw new Error('无可用资源')
 }
 
 async function startStreamingVP9() {
