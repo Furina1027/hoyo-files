@@ -62,7 +62,6 @@ declare module 'vue' {
     LucideTag: typeof import('@lucide/vue')['Tag']
     LucideTrash2: typeof import('@lucide/vue')['Trash2']
     LucideTriangleAlert: typeof import('@lucide/vue')['TriangleAlert']
-    LucideUser: typeof import('@lucide/vue')['User']
     LucideX: typeof import('@lucide/vue')['X']
     LucideXCircle: typeof import('@lucide/vue')['XCircle']
     NavBar: typeof import('./components/layout/NavBar.vue')['default']

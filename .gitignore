@@ -25,6 +25,9 @@ dist-ssr
 # 预下载文件（体积大，运行时生成）
 downloads/
 
+# chunk 索引（由构建快照和 manifest 运行时生成，不入库）
+*.index.json
+
 # 密钥库备份（历史快照，不入库）
 pkg_version/usm/*.bak*
 pkg_version/usm/*.bak_*
