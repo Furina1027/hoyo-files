@@ -233,6 +233,37 @@ function fetchLocalUsm(game, file, log = () => {}, customRoot = null) {
   return new Uint8Array(buf)
 }
 
+/**
+ * 只读本地 USM 的前 maxBytes 字节, 供"探测视频格式"用。
+ *
+ * detectUsmBytes 只需要第一个视频块的 magic (4 字节) 和 VIDEO_HDRINFO 里的
+ * AES-CTR nonce, 两者都在文件头部; 而完整文件动辄 300MB+, fetchLocalUsm 会
+ * readFileSync 全量 + new Uint8Array 再拷一份 —— 为了 4 个字节付出 600MB 级
+ * 的分配和磁盘读, 这是点播放后第一段干等的来源。
+ *
+ * 头部不足时 detectUsmBytes 会返回 null, 调用方需回退到 fetchLocalUsm 完整
+ * 读取, 因此这里不做任何判定逻辑, 只是少读。
+ */
+function fetchLocalUsmHead(game, file, log = () => {}, customRoot = null, maxBytes = 8 << 20) {
+  const found = locateLocalUsm(game, file, customRoot)
+  if (!found)
+    return null
+  const size = fs.statSync(found.path).size
+  const len = Math.min(maxBytes, size)
+  if (len <= 0)
+    return new Uint8Array(0)
+  const buf = Buffer.allocUnsafe(len)
+  const fd = fs.openSync(found.path, 'r')
+  try {
+    fs.readSync(fd, buf, 0, len, 0)
+  }
+  finally {
+    fs.closeSync(fd)
+  }
+  log(`[usm] 探测: 读取头部 ${len} 字节 (文件共 ${size} 字节) ${found.path}`)
+  return new Uint8Array(buf.buffer, buf.byteOffset, len)
+}
+
 const MIME = {
   '.json': 'application/json; charset=utf-8',
   '.txt': 'text/plain; charset=utf-8',
@@ -242,7 +273,33 @@ const MIME = {
   '.webp': 'image/webp',
 }
 
-const server = http.createServer(async (req, res) => {
+/**
+ * 宽松解码 URL 路径段。
+ *
+ * WHATWG URL 解析器不对 pathname 做百分号解码/校验, 落单的 '%' 或截断的
+ * UTF-8 (如 '/%'、'/%zz'、'/%e0%a4') 会原样留在 pathname 里; 随后调
+ * decodeURIComponent 就会抛 URIError。在 async request handler 里那等于
+ * unhandledRejection —— Node 15+ 默认 --unhandled-rejections=throw, 进程直接
+ * 结束, 而本服务是 start.cmd 后台拉起的, 崩了不会自愈。
+ *
+ * 非法转义返回 null, 由调用方回 400。
+ */
+function safeDecode(seg) {
+  try {
+    return decodeURIComponent(seg)
+  }
+  catch {
+    return null
+  }
+}
+
+/** 统一的非法路径段响应, 避免每个分支重复三行 */
+function sendBadRequest(res) {
+  res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' })
+  res.end('Bad Request')
+}
+
+async function handleRequest(req, res) {
   // 本地开发: 允许跨域 (vite dev server 不同端口)
   res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
@@ -318,9 +375,16 @@ const server = http.createServer(async (req, res) => {
     const gameDir = url.searchParams.get('game_dir') ?? null
     try {
       let format = null
-      const localUsm = fetchLocalUsm(game, file, msg => tlog(msg), gameDir)
-      if (localUsm) {
-        format = await detectUsmBytes(localUsm, { game, file, dataDir: DATA_ROOT, log: msg => tlog(msg) })
+      const localUsmHead = fetchLocalUsmHead(game, file, msg => tlog(msg), gameDir)
+      if (localUsmHead) {
+        format = await detectUsmBytes(localUsmHead, { game, file, dataDir: DATA_ROOT, log: msg => tlog(msg) })
+        if (!format) {
+          // 头部不足以判定 (第一个视频块比 maxBytes 更靠后): 回退完整读取,
+          // 行为与改动前完全一致。
+          const localUsm = fetchLocalUsm(game, file, msg => tlog(msg), gameDir)
+          if (localUsm)
+            format = await detectUsmBytes(localUsm, { game, file, dataDir: DATA_ROOT, log: msg => tlog(msg) })
+        }
       }
       if (!format && target) {
         try {
@@ -645,7 +709,11 @@ const server = http.createServer(async (req, res) => {
   // ---- API: 刷新指定游戏数据 ----
   const refreshMatch = url.pathname.match(/^\/api\/refresh\/([^/]+)$/)
   if (refreshMatch && req.method === 'POST') {
-    const gameId = decodeURIComponent(refreshMatch[1])
+    const gameId = safeDecode(refreshMatch[1])
+    if (gameId === null) {
+      sendBadRequest(res)
+      return
+    }
     try {
       const result = await refreshGame(gameId, DATA_ROOT, msg => console.log(msg))
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
@@ -661,7 +729,11 @@ const server = http.createServer(async (req, res) => {
   // ---- API: 更新 USM 文件历史 (对比当前版本 vs 上一个版本的 pkg_version 清单) ----
   const usmRefreshMatch = url.pathname.match(/^\/api\/refresh-usm-history\/([^/]+)$/)
   if (usmRefreshMatch && req.method === 'POST') {
-    const gameId = decodeURIComponent(usmRefreshMatch[1])
+    const gameId = safeDecode(usmRefreshMatch[1])
+    if (gameId === null) {
+      sendBadRequest(res)
+      return
+    }
     try {
       const result = updateUsmHistory(gameId, DATA_ROOT, msg => tlog(msg))
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
@@ -677,7 +749,11 @@ const server = http.createServer(async (req, res) => {
   // ---- API: 预下载单文件 chunk 直下信息 (浏览器端下载) ----
   const ciMatch = url.pathname.match(/^\/api\/predownload-chunkinfo\/([^/]+)$/)
   if (ciMatch && req.method === 'GET') {
-    const gameId = decodeURIComponent(ciMatch[1])
+    const gameId = safeDecode(ciMatch[1])
+    if (gameId === null) {
+      sendBadRequest(res)
+      return
+    }
     const file = url.searchParams.get('file') ?? ''
     try {
       const data = await predownloadChunkInfo(gameId, DATA_ROOT, file, msg => console.log(msg))
@@ -694,7 +770,12 @@ const server = http.createServer(async (req, res) => {
   // ---- API: 预下载汇总 (小响应, 含各 tag 统计) ----
   const sumMatch = url.pathname.match(/^\/api\/predownload-summary\/([^/]+)$/)
   if (sumMatch && req.method === 'GET') {
-    const data = predownloadSummary(decodeURIComponent(sumMatch[1]), DATA_ROOT)
+    const gameId = safeDecode(sumMatch[1])
+    if (gameId === null) {
+      sendBadRequest(res)
+      return
+    }
+    const data = predownloadSummary(gameId, DATA_ROOT)
     res.writeHead(data ? 200 : 404, { 'Content-Type': 'application/json; charset=utf-8' })
     res.end(JSON.stringify(data ?? { error: 'no predownload data' }))
     return
@@ -703,7 +784,11 @@ const server = http.createServer(async (req, res) => {
   // ---- API: 预下载目录浏览 (按需加载, 每次响应都很小) ----
   const dirMatch = url.pathname.match(/^\/api\/predownload\/([^/]+)$/)
   if (dirMatch && req.method === 'GET') {
-    const gameId = decodeURIComponent(dirMatch[1])
+    const gameId = safeDecode(dirMatch[1])
+    if (gameId === null) {
+      sendBadRequest(res)
+      return
+    }
     const data = predownloadDir(gameId, DATA_ROOT, url.searchParams.get('tag') ?? '', url.searchParams.get('dir') ?? '', url.searchParams.get('q') ?? '')
     res.writeHead(data ? 200 : 404, { 'Content-Type': 'application/json; charset=utf-8' })
     res.end(JSON.stringify(data ?? { error: 'no data' }))
@@ -713,7 +798,11 @@ const server = http.createServer(async (req, res) => {
   // ---- API: 预下载文件下载 (NDJSON 流式: 每完成一个文件推一行进度, 最后一行是结果) ----
   const dlMatch = url.pathname.match(/^\/api\/predownload-download\/([^/]+)$/)
   if (dlMatch && req.method === 'POST') {
-    const gameId = decodeURIComponent(dlMatch[1])
+    const gameId = safeDecode(dlMatch[1])
+    if (gameId === null) {
+      sendBadRequest(res)
+      return
+    }
     let body = {}
     try {
       body = JSON.parse(await readBody(req))
@@ -768,7 +857,12 @@ const server = http.createServer(async (req, res) => {
 
   // ---- 静态文件 ----
   // 防目录穿越: 去掉前导分隔符后 normalize, 再解析
-  const rel = path.normalize(decodeURIComponent(url.pathname)).replace(/^[\\/]+/, '')
+  const decodedPath = safeDecode(url.pathname)
+  if (decodedPath === null) {
+    sendBadRequest(res)
+    return
+  }
+  const rel = path.normalize(decodedPath).replace(/^[\\/]+/, '')
   const filePath = path.resolve(DATA_ROOT, rel)
   if (!filePath.startsWith(DATA_ROOT)) {
     res.writeHead(403)
@@ -830,6 +924,29 @@ const server = http.createServer(async (req, res) => {
     })
     fs.createReadStream(filePath).pipe(res)
   })
+}
+
+// 兜底: handler 内部任何未捕获的 rejection 都不允许结束进程。
+// 还没发头就回 500; 已经发头(NDJSON / 视频流)就断开, 让客户端看到错误
+// 而不是 ECONNRESET。
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch((err) => {
+    console.error('[fatal] 请求处理异常:', err)
+    if (res.headersSent)
+      res.destroy()
+    else
+      sendBadRequest(res)
+  })
+})
+
+// 进程级兜底: 只记日志不退出。单请求的异常由上面的 .catch 处理, 这里防的是
+// handler 之外(定时器、流回调、未 await 的 promise)漏网的 rejection ——
+// 一次崩溃意味着 8787 长时间不可用, 而本服务没有守护重启。
+process.on('unhandledRejection', (err) => {
+  console.error('[unhandledRejection]', err)
+})
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err)
 })
 
 // 仅监听回环: 该服务可经 game_dir 参数读取本机游戏文件, 不应对局域网暴露

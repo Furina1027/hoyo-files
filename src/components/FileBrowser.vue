@@ -56,12 +56,21 @@ const audioOptions = computed<FileBrowserAudioOption[]>(() => props.sourceA.audi
 const isLoading = computed(() => props.sourceA.isLoading || !!props.sourceB?.isLoading)
 const error = computed(() => props.sourceA.error || props.sourceB?.error || null)
 
+// 只在"数据集真的换了"时重置浏览状态。
+// 原来这里 watch 的是 [version, files, version, files] —— getter 每次返回新数组,
+// Object.is 恒为 false, 于是父组件每重新创建一次 files 数组就触发一次。而
+// Files.vue 的 currentFileSource 依赖 isLoadingFiles / fileLoadError /
+// activeAudioLangs, 加载状态一翻转就 mergeFiles 出新数组 —— 结果点语音包按钮
+// 或点"重新加载"会被弹回根目录、清空搜索框、关掉详情面板。
+// 改用 version(数据集身份) + files.length(内容规模) 两个稳定原始值:
+// 换版本一定会命中 version; 增删语音包一定会命中 length;
+// 而"同样内容重新创建数组"两个值都不变, 不再误触发。
 watch(
   () => [
     props.sourceA.version,
-    props.sourceA.files,
     props.sourceB?.version ?? null,
-    props.sourceB?.files ?? null,
+    props.sourceA.files.length,
+    props.sourceB?.files.length ?? 0,
   ],
   () => {
     currentPath.value = []

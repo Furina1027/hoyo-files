@@ -5,6 +5,7 @@ import {
   useChunkInfo,
   useGameVersions,
 } from '@/api/files'
+import { useLatestRequest } from '@/composables/useLatestRequest'
 import { AUDIO_LANG_FILES, AUDIO_LANG_LABELS, GameList } from '@/constants/core'
 import { useDownload } from '@/store/download'
 import { formatBytes } from '@/utils/file'
@@ -241,6 +242,13 @@ const browserAudioOptions = computed(() => {
   }))
 })
 
+// 主文件列表是单飞的: 同一时刻只该有一个请求在飞, 新请求直接作废旧的。
+// 否则快速切版本时 4.5.0(慢) 会后到并覆盖 4.4.0(快) 的结果, 而下拉框仍显示 4.4.0。
+const mainListReq = useLatestRequest()
+
+// 语音包允许多语言并发, 所以每个语言各记一个号, 不能共用一个。
+const audioReqSeq = new Map<string, number>()
+
 async function loadMainFileList(force: boolean = false) {
   if (!selectedVersion.value || isLoadingFiles.value)
     return
@@ -249,9 +257,16 @@ async function loadMainFileList(force: boolean = false) {
   isLoadingFiles.value = true
   fileLoadError.value = null
   try {
-    mainFileList.value = await fetchFileList(gameId.value, selectedVersion.value, 'pkg_version')
+    const list = await mainListReq.run(signal =>
+      fetchFileList(gameId.value, selectedVersion.value!, 'pkg_version', signal),
+    )
+    if (list === undefined)
+      return
+    mainFileList.value = list
   }
   catch (e) {
+    if ((e as Error).name === 'AbortError')
+      return
     fileLoadError.value = (e as Error).message
   }
   finally {
@@ -277,22 +292,36 @@ async function toggleAudioLang(lang: string) {
   loading.add(lang)
   loadingAudioLangs.value = loading
 
+  // 记下这次请求属于哪个游戏+版本+语言, 回来时逐项校验:
+  // 切了版本再回来就丢弃, 否则新版本的语音包列表里会混进旧版本的文件
+  // (md5/size 全错, 点下载必失败)。
+  const gid = gameId.value
+  const ver = selectedVersion.value!
+  const token = (audioReqSeq.get(lang) ?? 0) + 1
+  audioReqSeq.set(lang, token)
+
   try {
     const filename = AUDIO_LANG_FILES[lang]
-    const list = await fetchFileList(gameId.value, selectedVersion.value!, filename)
+    const list = await fetchFileList(gid, ver, filename)
+    if (gid !== gameId.value || ver !== selectedVersion.value || audioReqSeq.get(lang) !== token)
+      return
     const newMap = new Map(audioFileLists.value)
     newMap.set(lang, list)
     audioFileLists.value = newMap
   }
   catch {
+    if (gid !== gameId.value || ver !== selectedVersion.value || audioReqSeq.get(lang) !== token)
+      return
     const next = new Set(activeAudioLangs.value)
     next.delete(lang)
     activeAudioLangs.value = next
   }
   finally {
-    const nextLoading = new Set(loadingAudioLangs.value)
-    nextLoading.delete(lang)
-    loadingAudioLangs.value = nextLoading
+    if (audioReqSeq.get(lang) === token) {
+      const nextLoading = new Set(loadingAudioLangs.value)
+      nextLoading.delete(lang)
+      loadingAudioLangs.value = nextLoading
+    }
   }
 }
 

@@ -107,6 +107,30 @@ export const useDownload = defineStore('download', () => {
     }
   }
 
+  const manifestTaskData = new Map<string, {
+    manifest: ChunkManifest
+    gameId: string
+    version: string
+  }>()
+
+  const chunkTaskData = new Map<string, {
+    file: GameFileRecord
+    manifests: ChunkManifest[]
+    gameId: string
+    version: string
+  }>()
+
+  const mkvExportTaskData = new Map<string, {
+    filename: string
+    filePath: string
+    keyEntry: UsmKeyEntry
+    directDownloadUrl: string | null
+    bestChunkVersion: string | null
+    gameId: string
+    chIndex?: number
+    manifests?: ChunkManifest[]
+  }>()
+
   async function executeTask(task: DownloadTask) {
     try {
       if (task.type === 'manifest-json') {
@@ -125,23 +149,17 @@ export const useDownload = defineStore('download', () => {
       }
     }
     finally {
+      // 任务数据只增不删就会随失败/取消的次数单调上涨 (manifests 里还可能拖着
+      // vue-query 的响应式代理), 而这三个 Map 不是响应式, 界面上看不见、也没有
+      // 任何自动回收。executeTask 的 finally 是唯一覆盖成功/失败/取消/abort
+      // 全部出口的地方, 所以在这里统一清, 而不是散在各 run 函数的成功路径上。
       controllers.delete(task.id)
+      manifestTaskData.delete(task.id)
+      chunkTaskData.delete(task.id)
+      mkvExportTaskData.delete(task.id)
       processQueue()
     }
   }
-
-  const manifestTaskData = new Map<string, {
-    manifest: ChunkManifest
-    gameId: string
-    version: string
-  }>()
-
-  const chunkTaskData = new Map<string, {
-    file: GameFileRecord
-    manifests: ChunkManifest[]
-    gameId: string
-    version: string
-  }>()
 
   async function runManifestJsonTask(task: DownloadTask) {
     const data = manifestTaskData.get(task.id)
@@ -171,7 +189,6 @@ export const useDownload = defineStore('download', () => {
 
     setTaskStatus(task.id, 'success')
     setTaskProgress(task.id, 100)
-    manifestTaskData.delete(task.id)
   }
 
   async function runChunkFileTask(task: DownloadTask) {
@@ -216,7 +233,6 @@ export const useDownload = defineStore('download', () => {
     }
 
     if (!foundFile) {
-      chunkTaskData.delete(task.id)
       throw new Error('无可用资源')
     }
 
@@ -252,7 +268,6 @@ export const useDownload = defineStore('download', () => {
 
     setTaskStatus(task.id, 'success')
     setTaskProgress(task.id, 100)
-    chunkTaskData.delete(task.id)
   }
 
   function addManifestJsonTask(manifest: ChunkManifest, gameId: string, version: string) {
@@ -283,17 +298,6 @@ export const useDownload = defineStore('download', () => {
     tasks.value.unshift(task)
     processQueue()
   }
-
-  const mkvExportTaskData = new Map<string, {
-    filename: string
-    filePath: string
-    keyEntry: UsmKeyEntry
-    directDownloadUrl: string | null
-    bestChunkVersion: string | null
-    gameId: string
-    chIndex?: number
-    manifests?: ChunkManifest[]
-  }>()
 
   /** 流式下载响应并回报进度 (0-95%) */
   async function streamResponseWithProgress(res: Response, onProgress: (pct: number) => void): Promise<Uint8Array> {
@@ -359,6 +363,8 @@ export const useDownload = defineStore('download', () => {
     setTaskStatus(task.id, 'downloading')
     setTaskProgress(task.id, 0)
 
+    const reunion67Alias = gameId === 'hk4e' && filePath.replace(/\\/g, '/').split('/').pop()?.toLowerCase() === 'video_reunion_67_test.usm'
+
     if (fmt === 'mpeg1') {
       // 4.5 TV 类明文 MPEG1: 服务器借 ffmpeg 转码为 MP4 (无音轨)
       const t = tasks.value.find(x => x.id === task.id)
@@ -373,11 +379,8 @@ export const useDownload = defineStore('download', () => {
       setTaskStatus(task.id, 'merging')
       setTaskProgress(task.id, 99)
       triggerDownload(`${baseName}.mp4`, bytes, 'video/mp4')
-      return
     }
-
-    const reunion67Alias = gameId === 'hk4e' && filePath.replace(/\\/g, '/').split('/').pop()?.toLowerCase() === 'video_reunion_67_test.usm'
-    if (fmt === 'vp9' && gameId === 'hk4e' && (typeof keyEntry === 'object' || reunion67Alias)) {
+    else if (fmt === 'vp9' && gameId === 'hk4e' && (typeof keyEntry === 'object' || reunion67Alias)) {
       const t = tasks.value.find(x => x.id === task.id)
       if (t)
         t.name = `${baseName}.mkv`
@@ -393,10 +396,8 @@ export const useDownload = defineStore('download', () => {
       setTaskStatus(task.id, 'merging')
       setTaskProgress(task.id, 99)
       triggerDownload(`${baseName}.mkv`, bytes, 'video/x-matroska')
-      return
     }
-
-    if (fmt === 'h264') {
+    else if (fmt === 'h264') {
       const t = tasks.value.find(x => x.id === task.id)
       // 崩铁: H.264 USM 的 @SFA 是 ADX 音频, 服务器封装为含音轨的 MKV
       // (原神/绝区零保持 MP4/纯视频: 音频为 HCA 或不存在, 走 wasm 路径)
@@ -445,25 +446,32 @@ export const useDownload = defineStore('download', () => {
         const dec = await getUsmStreamDecoder(keyHex)
         const parts: Uint8Array[] = []
         const PUSH_SIZE = 4 * 1024 * 1024
-        for (let off = 0; off < usmBytes.length; off += PUSH_SIZE) {
-          if (signal.aborted)
-            return
-          const r = dec.push(usmBytes.subarray(off, off + PUSH_SIZE)) as {
-            init_segment?: Uint8Array
-            clusters?: Uint8Array[]
+        // dec 持有 wasm 线性内存, 只有 free() 才回收; 中止早退和 push/finish
+        // 抛错这两条路径原来都绕过了 free(), 每取消或失败一个视频就漏一个
+        // 实例。getUsmStreamDecoder 每次都 new, 不共享, 所以这里独占释放安全。
+        try {
+          for (let off = 0; off < usmBytes.length; off += PUSH_SIZE) {
+            if (signal.aborted)
+              return
+            const r = dec.push(usmBytes.subarray(off, off + PUSH_SIZE)) as {
+              init_segment?: Uint8Array
+              clusters?: Uint8Array[]
+            }
+            if (r.init_segment)
+              parts.push(r.init_segment)
+            for (const c of r.clusters ?? [])
+              parts.push(c)
+            setTaskProgress(task.id, Math.min(98, 85 + Math.round((off / usmBytes.length) * 13)))
           }
-          if (r.init_segment)
-            parts.push(r.init_segment)
-          for (const c of r.clusters ?? [])
+          const fin = dec.finish() as { init_segment?: Uint8Array, clusters?: Uint8Array[] }
+          if (fin.init_segment)
+            parts.push(fin.init_segment)
+          for (const c of fin.clusters ?? [])
             parts.push(c)
-          setTaskProgress(task.id, Math.min(98, 85 + Math.round((off / usmBytes.length) * 13)))
         }
-        const fin = dec.finish() as { init_segment?: Uint8Array, clusters?: Uint8Array[] }
-        if (fin.init_segment)
-          parts.push(fin.init_segment)
-        for (const c of fin.clusters ?? [])
-          parts.push(c)
-        dec.free()
+        finally {
+          dec.free()
+        }
 
         // 崩铁: 视频 WebM + 注入 ADX 音频 → 带音轨 MKV
         let output = concatU8(parts)
@@ -494,7 +502,6 @@ export const useDownload = defineStore('download', () => {
 
     setTaskStatus(task.id, 'success')
     setTaskProgress(task.id, 100)
-    mkvExportTaskData.delete(task.id)
   }
 
   function addUsmMkvExportTask(params: {

@@ -559,22 +559,35 @@ async function startStreaming() {
   if (!videoRef.value)
     return
 
+  // controller 必须覆盖整个生命周期, 含格式探测阶段。原来它在下面三个播放
+  // 函数里各建一个, 于是探测期间 abortController 还是 null —— 那时点关闭
+  // (handleClose) 或组件卸载 (onUnmounted) 的 abort() 落空, 探测请求继续跑,
+  // 探测完还会继续往下走, 对已卸载的 video 赋值并发起新的 fetch。
+  abortController = new AbortController()
+  const { signal } = abortController
+
   // 探测视频格式: H.264 与 MPEG1(4.5 TV 类, 服务器 ffmpeg 转码) 走整体 MP4 播放; VP9 走流式
   try {
-    const fmt = await probeVideoFormat()
+    const fmt = await probeVideoFormat(signal)
+    if (signal.aborted)
+      return
     if (fmt === 'h264' || fmt === 'mpeg1') {
-      await playH264()
+      await playH264(signal)
       return
     }
     if (fmt === 'vp9' && props.gameId === 'hk4e' && (typeof props.keyEntry === 'object' || props.serverAlias)) {
-      await playServerVp9()
+      await playServerVp9(signal)
       return
     }
   }
   catch {
-    // 探测失败回退 VP9 流式
+    // 探测失败回退 VP9 流式; 已中止则不再继续
+    if (signal.aborted)
+      return
   }
-  await startStreamingVP9()
+  if (signal.aborted)
+    return
+  await startStreamingVP9(signal)
 }
 
 /** 探测 USM 视频格式 (检查流 chunk 数据 magic) */
@@ -596,7 +609,7 @@ function detectVideoFormat(buf: Uint8Array): 'vp9' | 'h264' | 'mpeg1' | null {
   return null
 }
 
-async function probeVideoFormat(): Promise<'vp9' | 'h264' | 'mpeg1' | null> {
+async function probeVideoFormat(signal: AbortSignal): Promise<'vp9' | 'h264' | 'mpeg1' | null> {
   // 通过数据服务器探测 (服务器无浏览器网络/大响应限制; 加密文件用 key 解密后判断;
   // 本地游戏文件优先, 直链失败自动回退 chunk)
   if (props.directDownloadUrl || props.bestChunkVersion || props.localAvailable) {
@@ -609,7 +622,7 @@ async function probeVideoFormat(): Promise<'vp9' | 'h264' | 'mpeg1' | null> {
         params.set('url', props.directDownloadUrl)
       if (props.bestChunkVersion)
         params.set('version', props.bestChunkVersion)
-      const res = await fetch(`${API_BASE}/api/usm-detect?${params}`)
+      const res = await fetch(`${API_BASE}/api/usm-detect?${params}`, { signal })
       if (res.ok) {
         const data = await res.json() as { format?: string }
         if (data.format === 'vp9' || data.format === 'h264')
@@ -620,7 +633,7 @@ async function probeVideoFormat(): Promise<'vp9' | 'h264' | 'mpeg1' | null> {
   }
   // chunk 路径: 下载第一个 chunk 解压后探测
   if (props.bestChunkVersion) {
-    const firstChunk = await fetchFirstChunk()
+    const firstChunk = await fetchFirstChunk(signal)
     if (firstChunk) {
       const fmt = detectVideoFormat(firstChunk)
       if (fmt)
@@ -630,18 +643,20 @@ async function probeVideoFormat(): Promise<'vp9' | 'h264' | 'mpeg1' | null> {
   return null
 }
 
-async function fetchFirstChunk(): Promise<Uint8Array | null> {
-  const res = await fetch(`${API_BASE}/chunk/${props.gameId}_${props.bestChunkVersion}.json`)
+async function fetchFirstChunk(signal: AbortSignal): Promise<Uint8Array | null> {
+  const res = await fetch(`${API_BASE}/chunk/${props.gameId}_${props.bestChunkVersion}.json`, { signal })
   if (!res.ok)
     return null
   const json = await res.json()
   const manifests: ChunkManifest[] = json.data?.manifests ?? []
   for (const m of manifests) {
+    if (signal.aborted)
+      return null
     const cacheKey = `${props.gameId}_${props.bestChunkVersion}_${m.manifest.id}`
     const url = `${m.manifest_download.url_prefix}/${m.manifest.id}`
     let parsed
     try {
-      parsed = await fetchAndParseManifest(url, cacheKey, Number(m.manifest.uncompressed_size))
+      parsed = await fetchAndParseManifest(url, cacheKey, Number(m.manifest.uncompressed_size), signal)
     }
     catch {
       continue
@@ -649,7 +664,7 @@ async function fetchFirstChunk(): Promise<Uint8Array | null> {
     const match = parsed.files.find(f => f.path === props.filePath)
     if (match && match.chunks.length) {
       const c = match.chunks[0]
-      const r = await fetch(`${m.chunk_download.url_prefix}/${c.id}`)
+      const r = await fetch(`${m.chunk_download.url_prefix}/${c.id}`, { signal })
       if (!r.ok)
         return null
       const compressed = new Uint8Array(await r.arrayBuffer())
@@ -663,7 +678,7 @@ async function fetchFirstChunk(): Promise<Uint8Array | null> {
   return null
 }
 
-async function playServerVp9() {
+async function playServerVp9(signal: AbortSignal) {
   if (!videoRef.value)
     return
   phase.value = 'buffering'
@@ -671,8 +686,6 @@ async function playServerVp9() {
   progressLabel.value = '服务器解密 VP9...'
   audioStatusText.value = ''
   audioChannelList.value = []
-  abortController = new AbortController()
-  const { signal } = abortController
   try {
     const params = new URLSearchParams()
     params.set('game', props.gameId)
@@ -739,7 +752,7 @@ async function playServerVp9() {
 }
 
 /** H.264 路径: 服务器转 MP4 → 浏览器 fetch 下载 (带进度) → Blob URL 播放 (避开 video 直连加载的卡顿) */
-async function playH264() {
+async function playH264(signal: AbortSignal) {
   if (!videoRef.value)
     return
   phase.value = 'buffering'
@@ -747,9 +760,6 @@ async function playH264() {
   progressLabel.value = '服务器转换中...'
   audioStatusText.value = ''
   audioChannelList.value = []
-
-  abortController = new AbortController()
-  const { signal } = abortController
 
   try {
     // 服务器转换端点: 带 game+file (查 key 解密) + version (直链失效时回退 chunk 组装)
@@ -825,7 +835,7 @@ async function playH264() {
   }
 }
 
-async function startStreamingVP9() {
+async function startStreamingVP9(signal: AbortSignal) {
   if (!videoRef.value)
     return
 
@@ -851,8 +861,8 @@ async function startStreamingVP9() {
   audioStatusText.value = ''
   hasAutoSwitched = false
 
-  abortController = new AbortController()
-  const { signal } = abortController
+  if (signal.aborted)
+    return
 
   mediaSource = new MediaSource()
   objectUrl = URL.createObjectURL(mediaSource)
@@ -893,30 +903,40 @@ async function startStreamingVP9() {
   try {
     const dec = await getUsmStreamDecoder(maskKeyHex)
 
-    // 始终优先走服务器代理 (usm-proxy 内含 本地游戏文件 → 直链 → chunk 组装 三级回退;
-    // 浏览器直连 chunk 会绕过本地回退, 导致 Persistent 热更副本失效)
+    // dec 持有 wasm 线性内存 (VP9 参考帧 + 缓冲), 只有 free() 能还回去。
+    // 原来 free() 只写在成功路径上, 于是「中途点关闭」(:920 的 signal.aborted
+    // 早退) 和「streamDirect/streamChunks/dec.push 抛错」这两条出口都漏一个
+    // 实例 —— 而播放/关弹窗是本组件最高频的操作, 漏得比导出那条快得多。
+    // getUsmStreamDecoder 每次都 new、不共享, 所以这里独占释放安全。
     try {
-      await streamDirect(dec, sbQueue, signal)
+      // 始终优先走服务器代理 (usm-proxy 内含 本地游戏文件 → 直链 → chunk 组装 三级回退;
+      // 浏览器直连 chunk 会绕过本地回退, 导致 Persistent 热更副本失效)
+      try {
+        await streamDirect(dec, sbQueue, signal)
+      }
+      catch (e) {
+        const msg = typeof e === 'string' ? e : ((e as Error)?.message ?? String(e))
+        // 仅"流未开始"的失败才回退浏览器 chunk; 流中途失败直接抛出(避免重复推流)
+        if (!props.bestChunkVersion || !(e as any)?.preStream)
+          throw e
+        console.warn(`[usm] 代理流失败 (${msg}), 回退浏览器 chunk 下载`)
+        await streamChunks(props.bestChunkVersion, dec, sbQueue, signal)
+      }
+
+      if (signal.aborted)
+        return
+
+      const finalResult = dec.finish()
+      for (const c of finalResult.clusters as Uint8Array[])
+        sbQueue.append(c)
+      for (const chunk of (finalResult.audio_pcm_chunks ?? []))
+        feedAudioChunk(chunk)
     }
-    catch (e) {
-      const msg = typeof e === 'string' ? e : ((e as Error)?.message ?? String(e))
-      // 仅"流未开始"的失败才回退浏览器 chunk; 流中途失败直接抛出(避免重复推流)
-      if (!props.bestChunkVersion || !(e as any)?.preStream)
-        throw e
-      console.warn(`[usm] 代理流失败 (${msg}), 回退浏览器 chunk 下载`)
-      await streamChunks(props.bestChunkVersion, dec, sbQueue, signal)
+    finally {
+      // 紧贴最后一次使用dec 的位置释放: 下面 waitDrained / 音频收尾只用到
+      // 已 append 进 sbQueue 的 Uint8Array, 不再碰 dec。
+      dec.free()
     }
-
-    if (signal.aborted)
-      return
-
-    const finalResult = dec.finish()
-    for (const c of finalResult.clusters as Uint8Array[])
-      sbQueue.append(c)
-    for (const chunk of (finalResult.audio_pcm_chunks ?? []))
-      feedAudioChunk(chunk)
-
-    dec.free()
 
     await sbQueue.waitDrained(signal)
 

@@ -21,23 +21,30 @@ const usmKeyMap = ref<Record<string, UsmKeyEntry> | null>(null)
 // 按路径的 key 覆盖表: 绝区零有同名但内容不同的视频, keys.json 只能按文件名存一把
 const usmPathKeyMap = ref<Record<string, UsmKeyEntry> | null>(null)
 
+// 切游戏时旧的 in-flight 响应会后到并覆盖 usmKeyMap。拿错 key 是静默的:
+// findUsmKeyForPath 会用别的游戏的 key 去解密, 结果是满屏雪花, 没有任何报错。
+// 所以这里记下请求属于哪个游戏, 回来时校验。
 watch(gameId, async () => {
   usmKeyMap.value = null
   usmPathKeyMap.value = null
   if (!usmDecodeEnabled.value)
     return
+  const gid = gameId.value
   try {
-    const res = await fetch(`${API_BASE}/usm/${gameId.value}_keys.json`)
-    if (res.ok)
-      usmKeyMap.value = await res.json()
+    const res = await fetch(`${API_BASE}/usm/${gid}_keys.json`)
+    if (res.ok) {
+      const json = await res.json()
+      if (gid === gameId.value)
+        usmKeyMap.value = json
+    }
   }
   catch {}
   try {
-    const res = await fetch(`${API_BASE}/usm/${gameId.value}_keys_by_path.json`)
+    const res = await fetch(`${API_BASE}/usm/${gid}_keys_by_path.json`)
     if (res.ok) {
       const json = await res.json()
       const map = (json && typeof json === 'object' && json.keys) ? json.keys : json
-      if (map && typeof map === 'object')
+      if (map && typeof map === 'object' && gid === gameId.value)
         usmPathKeyMap.value = map
     }
   }
@@ -447,17 +454,22 @@ async function refreshLocalUsm() {
     localUsmInfo.value = {}
     return
   }
+  // 同上: 记下属于哪个游戏。切游戏后旧响应回来会把上一个游戏的路径写进
+  // localUsmPaths, 于是当前游戏的文件被误标成"可播放·本地", 点播放必然失败。
+  const gid = gameId.value
   try {
     const res = await fetch(`${API_BASE}/api/usm-local-files`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ game: gameId.value, game_dir: getLocalGameDir(gameId.value), files: pending }),
+      body: JSON.stringify({ game: gid, game_dir: getLocalGameDir(gid), files: pending }),
     })
     if (!res.ok)
       return
     const data = await res.json() as {
       found?: Record<string, { path: string, source: string, size: number | null }>
     }
+    if (gid !== gameId.value)
+      return
     const found = data.found ?? {}
     localUsmPaths.value = new Set(Object.keys(found))
     localUsmInfo.value = found

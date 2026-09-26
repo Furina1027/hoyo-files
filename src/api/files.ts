@@ -38,8 +38,8 @@ export async function fetchChunkInfo(gameId: string, version: string): Promise<C
   return json.data
 }
 
-export async function fetchFileList(gameId: string, version: string, filename: string): Promise<GameFileRecord[]> {
-  const res = await fetch(`${API_BASE}/${gameId}/${version}/${filename}`)
+export async function fetchFileList(gameId: string, version: string, filename: string, signal?: AbortSignal): Promise<GameFileRecord[]> {
+  const res = await fetch(`${API_BASE}/${gameId}/${version}/${filename}`, { signal })
   if (!res.ok)
     throw new Error(`Failed to fetch file list: ${res.status}`)
   const text = await res.text()

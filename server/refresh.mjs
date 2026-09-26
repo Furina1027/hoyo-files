@@ -790,6 +790,8 @@ export async function downloadPredownloadFiles(gameId, dataDir, { files = null, 
   catch (err) {
     log(`chunk 索引不可用, 将使用 diff 方式: ${err.message}`)
   }
+  // 下载前缀在同一批目标里是常量, 提到循环外 (原来每个文件都重读+重解析一次快照)
+  const chunkUrlPrefix = chunkUrlPrefixOf(gameId, dataDir, payload.predownload_version)
 
   const ok = []
   const failed = []
@@ -822,7 +824,7 @@ export async function downloadPredownloadFiles(gameId, dataDir, { files = null, 
             file: entry.file,
             size: chunkEntry.size,
             md5: chunkEntry.md5,
-            url_prefix: chunkUrlPrefixOf(gameId, dataDir, payload.predownload_version),
+            url_prefix: chunkUrlPrefix,
             url_suffix: '',
             chunks: chunkEntry.chunks,
           }
@@ -901,12 +903,9 @@ function loadPredownloadPayload(gameId, dataDir) {
   const p = path.join(dataDir, 'predownload', `${gameId}.json`)
   if (!fs.existsSync(p))
     return null
-  try {
-    return JSON.parse(fs.readFileSync(p, 'utf-8'))
-  }
-  catch {
-    return null
-  }
+  // 单个 payload 实测 2.7MB (nap 2351 条), 而这个函数每次请求预下载相关接口
+  // 都要走一遍; 走 mtime 缓存后首次解析后只剩一次 statSync。
+  return readJsonCached(p)
 }
 
 export function predownloadSummary(gameId, dataDir) {
@@ -994,10 +993,13 @@ async function getBranchesCached(gameId) {
 export async function ensureChunkIndex(gameId, dataDir, version, log = () => {}) {
   const indexPath = path.join(dataDir, 'chunk', `${gameId}_${version}.index.json`)
   if (fs.existsSync(indexPath)) {
-    try {
-      return JSON.parse(fs.readFileSync(indexPath, 'utf-8'))
-    }
-    catch { /* 重建 */ }
+    // 索引可达 38MB+, 每次调用都 readFileSync + JSON.parse 实测阻塞事件循环 239ms,
+    // 而这条路径每点一次"Chunk 下载"就走一次。readJsonCached 按 mtime 缓存,
+    // 首次解析后只花一次 statSync。
+    const cached = readJsonCached(indexPath)
+    if (cached)
+      return cached
+    // 缓存返回 null = 文件损坏/不可读 → 落到下面重建
   }
 
   // 已有 getBuild 快照则直接解析, 否则拉取
@@ -1157,7 +1159,7 @@ export async function detectUsmBytes(usm, { game = '', file = '', dataDir = null
     return null
   }
 
-  const videoChunks = parseUsmChunks(new Uint8Array(usm)).filter(c => c.type === '@SFV' || c.type === 'EVID')
+  const videoChunks = parseUsmChunks(usm).filter(c => c.type === '@SFV' || c.type === 'EVID')
   const fmt = check(videoChunks)
   if (fmt)
     return fmt
@@ -1502,7 +1504,7 @@ async function runFfmpeg(args, log) {
   await new Promise((resolve, reject) => {
     const process = spawn(ffmpeg, args, { stdio: ['ignore', 'ignore', 'pipe'] })
     let stderr = ''
-    process.stderr.on('data', d => { stderr += d.toString() })
+    process.stderr.on('data', data => { stderr += data.toString() })
     process.once('error', reject)
     process.once('exit', code => {
       if (code === 0)
@@ -1808,7 +1810,8 @@ export async function assembleUsmFromChunks(gameId, file, { version = '', dataDi
     const versionsPath = path.join(dataDir, `${gameId}_versions.json`)
     if (fs.existsSync(versionsPath)) {
       const versions = JSON.parse(fs.readFileSync(versionsPath, 'utf-8'))
-      version = Object.keys(versions).sort().at(-1) ?? ''
+      // 裸 sort() 是字典序, 会把 '1.9.0' 排在 '1.10.0' 之后而选错版本
+      version = Object.keys(versions).sort(compareVersions).at(-1) ?? ''
     }
   }
   if (!version)
@@ -1816,7 +1819,7 @@ export async function assembleUsmFromChunks(gameId, file, { version = '', dataDi
   const index = await ensureChunkIndex(gameId, dataDir, version, log)
   const entry = index[file]
   if (!entry)
-    throw new Error(`文件不在 ${version} 的 chunk 清单中`)
+    throw new Error(`文件不在 ${version} 的 chunk 清单中（该文件可能已从该版本 CDN 下架，且本地游戏目录未找到）`)
   const chunkInfo = {
     file,
     size: entry.size,
@@ -1848,7 +1851,8 @@ export function gameStatus(dataDir) {
       try {
         const versions = Object.keys(JSON.parse(fs.readFileSync(vp, 'utf-8')))
         item.versions = versions.length
-        item.latest_version = versions.sort().at(-1) ?? null
+        // 裸 sort() 是字典序, 会把 '1.9.0' 排在 '1.10.0' 之后而选错版本
+        item.latest_version = [...versions].sort(compareVersions).at(-1) ?? null
       }
       catch { /* 忽略 */ }
     }

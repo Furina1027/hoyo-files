@@ -59,7 +59,7 @@ export function parseUsmChunks(data: Uint8Array): UsmChunk[] {
         type: typeStr,
         isVideo: typeStr === 'EVID',
         chno,
-        data: data.slice(start, start + size),
+        data: data.subarray(start, start + size),
         frameTime: dv.getUint32(pos + 16, false),
       })
     }

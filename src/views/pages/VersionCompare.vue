@@ -138,28 +138,38 @@ async function loadDiffVersionFileList(version: string, force: boolean = false) 
   }
 
   const task = (async () => {
+    // 记下这次请求属于哪个游戏。切游戏后 resetDiffState() 只清了 Map, 已经 in-flight
+    // 的请求回来照样会写 —— 而三个游戏都有 1.0.0 / 4.5.0 这类相同版本号, 命中
+    // hasDiffMainFileList 检查后就会拿上一个游戏的文件列表当对比结果。
+    const gid = gameId.value
     const nextLoading = new Set(loadingDiffVersions.value)
     nextLoading.add(version)
     loadingDiffVersions.value = nextLoading
     diffVersionErrors.value = { ...diffVersionErrors.value, [version]: null }
 
     try {
-      const fileList = await fetchFileList(gameId.value, version, 'pkg_version')
+      const fileList = await fetchFileList(gid, version, 'pkg_version')
+      if (gid !== gameId.value)
+        return
       diffVersionMainFileLists.value = {
         ...diffVersionMainFileLists.value,
         [version]: fileList,
       }
     }
     catch (e) {
+      if (gid !== gameId.value)
+        return
       diffVersionErrors.value = {
         ...diffVersionErrors.value,
         [version]: (e as Error).message,
       }
     }
     finally {
-      const loading = new Set(loadingDiffVersions.value)
-      loading.delete(version)
-      loadingDiffVersions.value = loading
+      if (gid === gameId.value) {
+        const loading = new Set(loadingDiffVersions.value)
+        loading.delete(version)
+        loadingDiffVersions.value = loading
+      }
       diffVersionLoadTasks.delete(version)
     }
   })()
