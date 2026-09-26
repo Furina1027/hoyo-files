@@ -224,6 +224,24 @@ export async function apiCall(api, creds) {
 
 // ---------- manifest 下载与解析 ----------
 
+// getBuild 的 matching_field → 版本目录下清单文件名。
+// 与前端 src/constants/core.ts 的 AUDIO_LANG_FILES 保持一致（那份在 src 里，
+// 服务端不能 import —— 它会连带引入 @lucide/vue）。
+const AUDIO_LIST_FILES = [
+  { field: 'zh-cn', name: 'Audio_Chinese_pkg_version' },
+  { field: 'en-us', name: 'Audio_English(US)_pkg_version' },
+  { field: 'ja-jp', name: 'Audio_Japanese_pkg_version' },
+  { field: 'ko-kr', name: 'Audio_Korean_pkg_version' },
+]
+
+/** 一个版本的目录里应有的全部清单文件 */
+const ALL_LIST_FILES = [{ field: 'game', name: 'pkg_version' }, ...AUDIO_LIST_FILES]
+
+/** matching_field → 输出文件名 (未知分类回退到主资源) */
+function targetsFor(field) {
+  return ALL_LIST_FILES.find(t => t.field === field) ?? ALL_LIST_FILES[0]
+}
+
 export async function fetchAndParseManifest(ref, verify = true) {
   const url = joinUrl(ref.manifest_download?.url_prefix, ref.manifest.id, ref.manifest_download?.url_suffix)
   const expectedSize = verify ? Number(ref.manifest.compressed_size) : undefined
@@ -317,19 +335,55 @@ async function buildPredownloadDiff(buildInfo) {
 
 // ---------- 当前版本文件清单 (chunk 模式) ----------
 
-async function buildFileList(buildInfo, concurrency = 8) {
-  const parsed = await fetchAllManifests(buildInfo, concurrency)
-  const files = []
-  for (const raw of parsed) {
+/**
+ * 定位每个分类的「清单文件本体」在 manifest 里的条目。
+ *
+ * 关键: pkg_version / Audio_*_pkg_version 本身就是游戏安装包里的文件, manifest
+ * 里有它们的 chunk 信息, 直接下载即可 (pkg_version 只有 1 个 chunk, ~110 KB)。
+ *
+ * 不能从 manifest 反推内容 —— 真实清单里每条记录都带 hash 字段 (xxHash64), 而
+ * manifest 的 File 消息只有 file/chunks/is_folder/size/md5, 完全没有这个信息。
+ * 实测: 真实安装目录里的 pkg_version 与 orilights/pkg_version 发布的逐字节相同,
+ * 说明上游也是下载本体后直接发布, 不是生成的。
+ *
+ * matching_field 是官方的分类标识 (launcher API):
+ *   'game'   → 主资源, pkg_version
+ *   'zh-cn' / 'en-us' / 'ja-jp' / 'ko-kr' → 四个语音包清单
+ * 见 pkg_version/chunk/{game}_{ver}.json 里每个 manifest 的 matching_field 字段。
+ *
+ * 返回 Map<matching_field, { name, urlPrefix, entry }>; 没有 matching_field 的归到 'game'。
+ */
+async function locateListFileEntries(buildInfo, concurrency = 8) {
+  const manifests = buildInfo.data?.manifests ?? []
+  const parsed = await mapPool(manifests, concurrency, ref => fetchAndParseManifest(ref))
+  const out = new Map()
+  for (const [i, raw] of parsed.entries()) {
+    const ref = manifests[i]
+    const key = ref?.matching_field || 'game'
+    const name = targetsFor(key).name
     const msg = ChunkManifestMsg.decode(raw)
     const man = ChunkManifestMsg.toObject(msg, DECODE_OPTS)
-    for (const f of man.chuncks ?? []) {
-      if (f.is_folder)
-        continue
-      files.push({ remoteName: f.file, md5: f.md5 ?? '', fileSize: Number(f.size ?? 0) })
-    }
+    const entry = (man.chuncks ?? []).find(f => !f.is_folder && f.file === name)
+    if (!entry)
+      continue
+    out.set(key, {
+      name,
+      urlPrefix: ref?.chunk_download?.url_prefix ?? '',
+      entry: {
+        size: Number(entry.size ?? 0),
+        md5: entry.md5 ?? '',
+        chunks: (entry.chunks ?? []).map(c => ({
+          id: c.id,
+          offset: Number(c.offset ?? 0),
+          compressed_size: Number(c.compressed_size ?? 0),
+          uncompressed_size: Number(c.uncompressed_size ?? 0),
+          compressed_md5: c.compressed_md5 ?? '',
+          uncompressed_md5: c.uncompressed_md5 ?? '',
+        })),
+      },
+    })
   }
-  return files
+  return out
 }
 
 // ---------- versions.json ----------
@@ -391,7 +445,10 @@ export async function refreshGame(gameId, dataDir, log = () => {}) {
       if (manifests.length) {
         log(`[${gameId}] 预下载 ${buildInfo.data.tag}: ${manifests.length} 个 manifest, 下载解析中...`)
         const diffs = await buildPredownloadDiff(buildInfo)
-        const tags = Object.keys(diffs)
+        // 降序 (最新在前)。diffs 是 Map, Object.keys 的顺序取决于官方 manifest 里
+        // patch 条目的出现次序, 属外部数据决定的 incidental 顺序; 下面 :397 / :407
+        // 的 tags.at(-1) 都按"末尾=最新"的假设写的, 不排序就会取到最旧的 tag。
+        const tags = Object.keys(diffs).sort((a, b) => compareVersions(b, a))
         const payload = {
           game: gameId,
           current_version: main?.tag ?? tags.at(-1) ?? '',
@@ -424,9 +481,13 @@ export async function refreshGame(gameId, dataDir, log = () => {}) {
   }
 
   // 2) 当前版本文件清单 (仅本地缺失时)
+  // 一个版本目录应有 5 个清单: pkg_version(主资源) + 4 个语音包。
+  // 它们本身就在游戏安装包里, 按 chunk 下载本体 (含 hash 字段), 不能从 manifest 反推。
   if (main?.tag) {
-    const listPath = path.join(dataDir, gameId, main.tag, 'pkg_version')
-    if (!fs.existsSync(listPath)) {
+    const listDir = path.join(dataDir, gameId, main.tag)
+    const targets = ALL_LIST_FILES
+    const missing = targets.filter(t => !fs.existsSync(path.join(listDir, t.name)))
+    if (missing.length === targets.length) {
       try {
         const buildInfo = await apiCall('getBuild', {
           branch: main.branch ?? 'main',
@@ -440,19 +501,44 @@ export async function refreshGame(gameId, dataDir, log = () => {}) {
           const chunkDir = path.join(dataDir, 'chunk')
           fs.mkdirSync(chunkDir, { recursive: true })
           fs.writeFileSync(path.join(chunkDir, `${gameId}_${main.tag}.json`), JSON.stringify(buildInfo), 'utf-8')
-          // 文件清单
-          const files = await buildFileList(buildInfo)
-          const listDir = path.join(dataDir, gameId, main.tag)
+          // 按 matching_field 定位各分类的清单文件, 逐个下载
+          const located = await locateListFileEntries(buildInfo)
           fs.mkdirSync(listDir, { recursive: true })
-          fs.writeFileSync(path.join(listDir, 'pkg_version'), files.map(f => JSON.stringify(f)).join('\n'), 'utf-8')
-          result.file_list = { version: main.tag, files: files.length }
-          log(`[${gameId}] 文件清单已生成: ${files.length} 个文件`)
+          let total = 0
+          for (const t of targets) {
+            const hit = located.get(t.field)
+            if (!hit) {
+              log(`[${gameId}]   ${t.name}: 该版本 manifest 里没有自身条目 (matching_field=${t.field}), 跳过`)
+              continue
+            }
+            if (!hit.urlPrefix) {
+              log(`[${gameId}]   ${t.name}: manifest 未提供 chunk_download.url_prefix, 跳过`)
+              continue
+            }
+            const out = path.join(listDir, t.name)
+            await downloadChunkFile({
+              url_prefix: hit.urlPrefix,
+              url_suffix: '',
+              size: hit.entry.size,
+              md5: hit.entry.md5,
+              chunks: hit.entry.chunks,
+            }, out, log)
+            const count = fs.readFileSync(out, 'utf-8').split('\n').filter(s => s.trim()).length
+            total += count
+            log(`[${gameId}]   ${t.name}: ${hit.entry.size} 字节 / ${count} 条 (${hit.entry.chunks.length} 个 chunk)`)
+          }
+          result.file_list = { version: main.tag, files: total }
+          log(`[${gameId}] 文件清单已下载: ${total} 条 (${located.size} 个分类)`)
         }
       }
       catch (err) {
         result.file_list = { error: err.message }
-        log(`[${gameId}] 文件清单生成失败: ${err.message}`)
+        log(`[${gameId}] 文件清单下载失败: ${err.message}`)
       }
+    }
+    else if (missing.length) {
+      result.file_list = { version: main.tag, partial: missing.map(t => t.name) }
+      log(`[${gameId}] 当前版本 ${main.tag} 清单不完整, 缺 ${missing.map(t => t.name).join(', ')} (需手动删除该版本目录后重新刷新)`)
     }
     else {
       result.file_list = { version: main.tag, existed: true }

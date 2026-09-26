@@ -4,6 +4,7 @@ import { usePredownloadDir, usePredownloadSummary } from '@/api/predownload'
 import { API_BASE } from '@/constants/core'
 import { downloadChunks } from '@/utils/chunk'
 import { formatBytes } from '@/utils/file'
+import { compareSemver } from '@/utils/semver'
 
 const route = useRoute()
 const gameId = computed(() => route.params.gameId as string)
@@ -44,11 +45,20 @@ const searchQuery = ref('')
 const changeTypeFilter = ref<'added' | 'modified' | 'deleted' | null>(null)
 const currentPath = ref<string[]>([])
 
+// 「更新前版本」可选项, 按 semver 降序 (最新在前)。
+// payload 里的 tags 顺序来自官方 manifest 中 patch 条目的出现次序 (refresh.mjs
+// 里 Object.keys(diffs)), 那是外部数据决定的 incidental 顺序, 不能依赖 ——
+// 之前这里取 tags.at(-1) 当默认值, 在 tags 本就降序的 hk4e/nap 上会选中最旧的
+// 那个 (预下载 7.1 时默认 6.7 而非 7.0)。
+const sortedTags = computed(() =>
+  summary.value ? [...summary.value.tags].sort((a, b) => compareSemver(b, a)) : [],
+)
+
 watch(summary, (value) => {
   if (!value)
     return
   if (!activeTag.value || !value.tags.includes(activeTag.value))
-    activeTag.value = value.tags.at(-1) ?? null
+    activeTag.value = sortedTags.value[0] ?? null
 }, { immediate: true })
 
 watch([activeTag, searchQuery, changeTypeFilter], () => {
@@ -413,10 +423,10 @@ async function handleDownload(files: string[] | null, dirs: string[] | null, lab
         </div>
 
         <!-- 旧版本 tag 切换 -->
-        <div v-if="summary.tags.length > 1" class="mt-2.5 flex flex-wrap items-center gap-1.5">
+        <div v-if="sortedTags.length > 1" class="mt-2.5 flex flex-wrap items-center gap-1.5">
           <span class="text-xs text-gray-400 dark:text-gray-500">更新前版本:</span>
           <button
-            v-for="tag in summary.tags"
+            v-for="tag in sortedTags"
             :key="tag"
             class="rounded-full px-2.5 py-0.5 font-mono text-xs font-medium transition-colors"
             :class="activeTag === tag
