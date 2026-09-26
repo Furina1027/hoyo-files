@@ -18,10 +18,10 @@
 
 | 游戏         | 视频总数     | 已有密钥     | 密钥覆盖      |
 | ---------- | -------- | -------- | --------- |
-| 原神 CN      | 354      | 353      | 99.7%     |
-| 崩坏：星穹铁道 CN | 1197     | 1188     | 99.2%     |
+| 原神 CN      | 354      | 354      | 100%      |
+| 崩坏：星穹铁道 CN | 1218     | 1188     | 97.5%     |
 | 绝区零 CN     | 2591     | 2584     | 99.7%     |
-| **合计**     | **4142** | **4125** | **99.6%** |
+| **合计**     | **4163** | **4126** | **99.1%** |
 
 > 绝区零的 history 按路径记录，共 2635 条 `.usm` 记录；其中 41 个文件名在多个目录中  
 > 重复出现，**但这些同名文件并不是同一份副本** —— 内容、体积、官方下发的 vk 都不同  
@@ -31,22 +31,43 @@
 > 这些同名文件的差异化密钥由 `pkg_version/usm/nap_keys_by_path.json` 按路径补齐，
 > 详见下方「密钥库结构」。
 
-### 尚缺密钥的文件（共 16 个）
+### 尚缺密钥的文件（共 37 个）
 
 
-**崩坏：星穹铁道 CN（9 个）**
+**崩坏：星穹铁道 CN（30 个）**
 
 | 文件名                        | 可下载版本 | 大小      |
 | -------------------------- | ----- | ------- |
+| `Activity_MechCraft`       | 4.6.0 | 41.3 MB |
+| `Activity_Petmarble`        | 4.6.0 | 0.9 MB |
 | `CS_Activity_FateRin_CN_f` | 4.4.0 | 39.4 MB |
 | `CS_Activity_FateRin_CN_m` | 4.4.0 | 39.5 MB |
 | `CS_Activity_FateRin_EN_f` | 4.4.0 | 38.3 MB |
 | `CS_Activity_FateRin_EN_m` | 4.4.0 | 39.4 MB |
 | `CS_Activity_FateRin_JP_f` | 4.4.0 | 39.4 MB |
-| `CS_Activity_FateRin_JP_m` | 4.4.0 | 39.4 MB |
+| `CS_Activity_FateRin_JP_m` | 4.4.0 | 39.5 MB |
 | `CS_Activity_FateRin_KR_f` | 4.4.0 | 38.3 MB |
 | `CS_Activity_FateRin_KR_m` | 4.4.0 | 39.5 MB |
+| `CS_Chap05_Act480`         | 4.6.0 | 56.0 MB |
+| `CS_Chap05_Act490_f`       | 4.6.0 | 40.3 MB |
+| `CS_Chap05_Act490_m`       | 4.6.0 | 40.3 MB |
+| `CS_Chap05_Act570_f`       | 4.6.0 | 50.7 MB |
+| `CS_Chap05_Act570_m`       | 4.6.0 | 50.6 MB |
+| `CS_Chap05_Act580_f`       | 4.6.0 | 68.2 MB |
+| `CS_Chap05_Act580_m`       | 4.6.0 | 68.2 MB |
+| `CS_Chap05_Act590_f`       | 4.6.0 | 52.6 MB |
+| `CS_Chap05_Act590_m`       | 4.6.0 | 52.5 MB |
+| `CS_Chap05_Act600_f`       | 4.6.0 | 59.5 MB |
+| `CS_Chap05_Act600_m`       | 4.6.0 | 59.4 MB |
 | `CS_ChapLoop04_Act0330`    | 3.1.0 | 8.6 MB  |
+| `CS_ChapLoop05_Act0460`    | 4.6.0 | 9.7 MB  |
+| `CS_ChapLoop05_Act0470`    | 4.6.0 | 9.1 MB  |
+| `CS_ChapLoop05_Act0471`    | 4.6.0 | 4.0 MB  |
+| `CS_ChapLoop05_Act0472`    | 4.6.0 | 9.1 MB  |
+| `CS_ChapLoop05_Act0473`    | 4.6.0 | 10.3 MB |
+| `CS_ChapLoop05_Act0480`    | 4.6.0 | 8.8 MB  |
+| `CS_ChapLoop05_Act0481`    | 4.6.0 | 8.8 MB  |
+| `CS_ChapLoop05_Act0490`    | 4.6.0 | 8.9 MB  |
 
 **绝区零 CN（7 个）**
 
