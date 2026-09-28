@@ -1663,8 +1663,14 @@ export async function usmBytesToWebm(usm, { game = '', file = '', dataDir = null
   const { format, stream } = await prepareVideoStream(usm, { game, file, dataDir, log })
   const keyMode = resolveKeyEntry(findUsmKey(dataDir, game, file)).mode
   // 67_test 的历史回退源是旧 mask VP9；与 7.1 AES VP9 共用同一条服务器解密播放路径。
-  if (format !== 'vp9' || game !== 'hk4e' || (keyMode !== 'aes' && keyMode !== 'mask'))
-    throw new Error('WebM 导出仅支持原神 VP9 视频')
+  // 崩铁 2.3 之前的 LOOP 系列是**未加密** VP9/IVF（key 库全 0 约定值），此前被这条
+  // gate 挡掉，只能退回浏览器 WASM 流式；而 WASM 的 IVF→WebM 封装对明文输入会照跑
+  // 掩码反馈（decryptVideo 从每块 0x140 起），把数据打乱，浏览器 VP9 解码器直接报错，
+  // 最终表现为 appendBuffer 抛 "HTMLMediaElement.error attribute is not null"。
+  // 明文 VP9 无需解密 —— prepareVideoStream 的 plain 分支已按原样返回裸流，
+  // 直接交给 ffmpeg -c:v copy 封装即可（无音轨的 LOOP 文件会自动只映射视频轨）。
+  if (format !== 'vp9' || (keyMode !== 'aes' && keyMode !== 'mask' && keyMode !== 'plain'))
+    throw new Error('WebM 导出仅支持 VP9 视频')
   const audio = includeAudio ? await decodeAudioWavs(usm, { game, file, dataDir, chIndex, log }) : []
   return await muxVp9WithFfmpeg(stream, audio, 'webm', { log })
 }
@@ -1688,7 +1694,8 @@ export async function usmBytesToMkv(usm, { game = '', file = '', dataDir = null,
   const { format, stream: video } = await prepareVideoStream(usm, { game, file, dataDir, log })
   if (format === 'vp9') {
     const keyMode = resolveKeyEntry(findUsmKey(dataDir, game, file)).mode
-    if (game === 'hk4e' && (keyMode === 'aes' || keyMode === 'mask')) {
+    // 同 usmBytesToWebm: 明文 VP9(崩铁 2.3 前的 LOOP 系列) 也走 ffmpeg 封装
+    if (keyMode === 'aes' || keyMode === 'mask' || keyMode === 'plain') {
       const audio = await decodeAudioWavs(usm, { game, file, dataDir, chIndex, log })
       return await muxVp9WithFfmpeg(video, audio, 'mkv', { log })
     }

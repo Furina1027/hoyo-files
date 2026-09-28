@@ -575,7 +575,12 @@ async function startStreaming() {
       await playH264(signal)
       return
     }
-    if (fmt === 'vp9' && props.gameId === 'hk4e' && (typeof props.keyEntry === 'object' || props.serverAlias)) {
+    if (fmt === 'vp9') {
+      // VP9 一律走服务端 ffmpeg 封装 (-c:v copy, 不重编码)。原神 7.1 原本如此;
+      // 崩铁 2.3 之前的 LOOP 系列是未加密 VP9/IVF, 浏览器 WASM 流式的 IVF→WebM
+      // 封装对明文输入会照跑掩码反馈把数据打乱 (解码器报错 → appendBuffer 抛
+      // "HTMLMediaElement.error attribute is not null"), 所以也归到服务端。
+      // 服务端不可用时 playServerVp9 抛错, 由下面的 catch 回退流式。
       await playServerVp9(signal)
       return
     }
