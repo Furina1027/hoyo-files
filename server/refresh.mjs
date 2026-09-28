@@ -237,9 +237,19 @@ const AUDIO_LIST_FILES = [
 /** 一个版本的目录里应有的全部清单文件 */
 const ALL_LIST_FILES = [{ field: 'game', name: 'pkg_version' }, ...AUDIO_LIST_FILES]
 
-/** matching_field → 输出文件名 (未知分类回退到主资源) */
+/** matching_field → 输出文件名; 不在已知表里返回 null (不回退, 避免把未知分类误认成 pkg_version) */
 function targetsFor(field) {
-  return ALL_LIST_FILES.find(t => t.field === field) ?? ALL_LIST_FILES[0]
+  return ALL_LIST_FILES.find(t => t.field === field)?.name ?? null
+}
+
+/**
+ * 该 manifest 是否可能含清单自引用条目 —— 用来避免全量解析 manifest。
+ * 已知 matching_field 直接放行; 再按 category_name 含「语音」兜底, 防官方改名后漏掉。
+ */
+function isListCandidate(ref) {
+  if (ref?.matching_field && targetsFor(ref.matching_field))
+    return true
+  return /语音/.test(ref?.category_name ?? '')
 }
 
 export async function fetchAndParseManifest(ref, verify = true) {
@@ -351,21 +361,38 @@ async function buildPredownloadDiff(buildInfo) {
  *   'zh-cn' / 'en-us' / 'ja-jp' / 'ko-kr' → 四个语音包清单
  * 见 pkg_version/chunk/{game}_{ver}.json 里每个 manifest 的 matching_field 字段。
  *
- * 返回 Map<matching_field, { name, urlPrefix, entry }>; 没有 matching_field 的归到 'game'。
+ * 不是所有游戏都有语音包清单, 且并非所有语音 manifest 都含自引用条目, 实测:
+ *   hk4e 5 个 manifest  → game + 4 语音, 语音 manifest 都有自引用条目  → 5 个清单
+ *   nap  118 个 manifest → 同上, 但另有 4 个 mini-* 登录语音小包, 内容与对应
+ *                         语音包清单完全相同 (同一文件名/大小), 去重后仍是 5 个
+ *   hkrpg 5 个 manifest  → 语音 manifest 里没有自引用条目              → 只有 1 个
+ *   bh3  2 个 manifest  → 完全没有语音分类                            → 只有 1 个
+ * 与上游 orilights/pkg_version 各游戏实际发布的文件数一致。
+ *
+ * 返回 Map<matching_field, { name, urlPrefix, entry }>, 只含确实存在自引用条目的分类。
+ * 同一输出文件名只下载一次 (nap 的 mini-* 与常规语音包指向同一文件)。
  */
 async function locateListFileEntries(buildInfo, concurrency = 8) {
   const manifests = buildInfo.data?.manifests ?? []
-  const parsed = await mapPool(manifests, concurrency, ref => fetchAndParseManifest(ref))
+  // 只下载可能含清单自引用条目的 manifest。nap 有 118 个, 其中 113 个是活动场景/
+  // 影像档案之类的资源分类, 全量解析纯属浪费。
+  const candidates = manifests.filter(isListCandidate)
+  const parsed = await mapPool(candidates, concurrency, ref => fetchAndParseManifest(ref))
   const out = new Map()
+  const byName = new Map()
+
   for (const [i, raw] of parsed.entries()) {
-    const ref = manifests[i]
+    const ref = candidates[i]
     const key = ref?.matching_field || 'game'
-    const name = targetsFor(key).name
+    const name = targetsFor(key)
+    if (!name || byName.has(name))
+      continue
     const msg = ChunkManifestMsg.decode(raw)
     const man = ChunkManifestMsg.toObject(msg, DECODE_OPTS)
     const entry = (man.chuncks ?? []).find(f => !f.is_folder && f.file === name)
     if (!entry)
       continue
+    byName.set(name, key)
     out.set(key, {
       name,
       urlPrefix: ref?.chunk_download?.url_prefix ?? '',
@@ -481,13 +508,13 @@ export async function refreshGame(gameId, dataDir, log = () => {}) {
   }
 
   // 2) 当前版本文件清单 (仅本地缺失时)
-  // 一个版本目录应有 5 个清单: pkg_version(主资源) + 4 个语音包。
-  // 它们本身就在游戏安装包里, 按 chunk 下载本体 (含 hash 字段), 不能从 manifest 反推。
+  // 清单文件本身就在游戏安装包里, 按 chunk 下载本体 (含 hash 字段), 不能从 manifest 反推。
+  // 各游戏实际有几个清单取决于其 manifest 里哪些分类带自引用条目:
+  //   hk4e / nap → 5 个 (pkg_version + 4 语音包);  hkrpg / bh3 → 只有 pkg_version。
+  // 所以这里只以 pkg_version 为判据, 语音包有多少下多少, 缺了也不报警告。
   if (main?.tag) {
     const listDir = path.join(dataDir, gameId, main.tag)
-    const targets = ALL_LIST_FILES
-    const missing = targets.filter(t => !fs.existsSync(path.join(listDir, t.name)))
-    if (missing.length === targets.length) {
+    if (!fs.existsSync(path.join(listDir, 'pkg_version'))) {
       try {
         const buildInfo = await apiCall('getBuild', {
           branch: main.branch ?? 'main',
@@ -501,21 +528,16 @@ export async function refreshGame(gameId, dataDir, log = () => {}) {
           const chunkDir = path.join(dataDir, 'chunk')
           fs.mkdirSync(chunkDir, { recursive: true })
           fs.writeFileSync(path.join(chunkDir, `${gameId}_${main.tag}.json`), JSON.stringify(buildInfo), 'utf-8')
-          // 按 matching_field 定位各分类的清单文件, 逐个下载
+          // 只解析可能含清单自引用条目的 manifest (nap 有 118 个, 绝大多数无关)
           const located = await locateListFileEntries(buildInfo)
           fs.mkdirSync(listDir, { recursive: true })
           let total = 0
-          for (const t of targets) {
-            const hit = located.get(t.field)
-            if (!hit) {
-              log(`[${gameId}]   ${t.name}: 该版本 manifest 里没有自身条目 (matching_field=${t.field}), 跳过`)
-              continue
-            }
+          for (const [key, hit] of located) {
             if (!hit.urlPrefix) {
-              log(`[${gameId}]   ${t.name}: manifest 未提供 chunk_download.url_prefix, 跳过`)
+              log(`[${gameId}]   ${hit.name}: manifest 未提供 chunk_download.url_prefix, 跳过`)
               continue
             }
-            const out = path.join(listDir, t.name)
+            const out = path.join(listDir, hit.name)
             await downloadChunkFile({
               url_prefix: hit.urlPrefix,
               url_suffix: '',
@@ -525,20 +547,19 @@ export async function refreshGame(gameId, dataDir, log = () => {}) {
             }, out, log)
             const count = fs.readFileSync(out, 'utf-8').split('\n').filter(s => s.trim()).length
             total += count
-            log(`[${gameId}]   ${t.name}: ${hit.entry.size} 字节 / ${count} 条 (${hit.entry.chunks.length} 个 chunk)`)
+            log(`[${gameId}]   ${hit.name} (${key}): ${hit.entry.size} 字节 / ${count} 条 (${hit.entry.chunks.length} 个 chunk)`)
           }
+          const absent = ALL_LIST_FILES.filter(t => !located.has(t.field)).map(t => t.name)
+          if (absent.length)
+            log(`[${gameId}]   该版本无对应清单文件: ${absent.join(', ')}`)
           result.file_list = { version: main.tag, files: total }
-          log(`[${gameId}] 文件清单已下载: ${total} 条 (${located.size} 个分类)`)
+          log(`[${gameId}] 文件清单已下载: ${total} 条 (${located.size} 个文件)`)
         }
       }
       catch (err) {
         result.file_list = { error: err.message }
         log(`[${gameId}] 文件清单下载失败: ${err.message}`)
       }
-    }
-    else if (missing.length) {
-      result.file_list = { version: main.tag, partial: missing.map(t => t.name) }
-      log(`[${gameId}] 当前版本 ${main.tag} 清单不完整, 缺 ${missing.map(t => t.name).join(', ')} (需手动删除该版本目录后重新刷新)`)
     }
     else {
       result.file_list = { version: main.tag, existed: true }

@@ -244,5 +244,18 @@
       "password": "h6XjD8ReKlR1",
       "tag": "9.0.0"
     }
+  },
+  "9.1.0": {
+    "game": {},
+    "voice": {},
+    "update": {},
+    "decompressed_path": null,
+    "chunk": {
+      "branch": "main",
+      "diff_tags": [],
+      "package_id": "jdEaAE9pKa",
+      "password": "h6XjD8ReKlR1",
+      "tag": "9.1.0"
+    }
   }
 }
