@@ -61,11 +61,16 @@ let audioSource: AudioBufferSourceNode | null = null
 
 /** 掩码 key (4.4 字符串条目); 4.5 method2 对象条目的音频不走掩码 → 传全零 */
 const maskKeyHex = typeof props.keyEntry === 'string' ? props.keyEntry : '0000000000000000'
-/** 4.5 method2 的 HCA 音频 keycode (对象条目才有) */
-// 67_test 的 key 条目只负责让历史列表显示可播放；音频沿用历史 67 的旧 key。
+/**
+ * HCA 音频 keycode。每个游戏/版本的派生方式不同:
+ *   - 4.5 method2 对象条目: 官方下发的独立 audio 字段 (原神 7.1)
+ *   - 4.4 mask 字符串条目: HCA keycode 由 mask key 派生 (原神 7.1 之前全系列,
+ *     与 wasm 流式解码器内部行为一致; 崩铁/绝区零音频是 ADX, 不会走到 HCA 分支)
+ * 全零 mask key (明文约定) 不作为 keycode 使用。
+ */
 const hcaAudioKeyHex = (typeof props.keyEntry === 'object' && props.keyEntry?.audio)
   ? props.keyEntry.audio
-  : props.serverAlias ? maskKeyHex : ''
+  : maskKeyHex !== '0000000000000000' ? maskKeyHex : ''
 
 const settings = useSettings()
 

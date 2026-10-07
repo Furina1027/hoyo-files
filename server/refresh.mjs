@@ -850,7 +850,7 @@ async function sliceEntryCached(entry, bundleCacheDir, bundleFileMap) {
   if (!cachedPath || !fs.existsSync(cachedPath)) {
     const url = joinUrl(entry.url_prefix, entry.bundle_id, entry.url_suffix)
     const buf = await fetchBytes(url, { expectedSize: entry.bundle_size || undefined, expectedMd5: entry.bundle_md5 || undefined })
-    cachedPath = path.join(bundleCacheDir, `bundle_${String(entry.bundle_id).replace(/[^a-zA-Z0-9_-]/g, '_')}.bin`)
+    cachedPath = path.join(bundleCacheDir, `bundle_${String(entry.bundle_id).replace(/[^\w-]/g, '_')}.bin`)
     fs.writeFileSync(cachedPath, buf)
     bundleFileMap.set(entry.bundle_id, cachedPath)
   }
@@ -1579,10 +1579,20 @@ function pcmToWav(pcm, sampleRate, channels) {
   return new Uint8Array(output)
 }
 
-// 历史 67 的 HCA 音频使用旧 mask key 的低 56 位；不能套用 67_test 的 HCA key。
-function reunionHcaAudioKey(file, key) {
-  const base = path.basename(String(file ?? '').replace(/\\/g, '/')).toLowerCase()
-  return base === 'video_reunion_67.usm' && key.mode === 'mask' ? key.keyHex : ''
+/**
+ * HCA 音频 keycode。每个游戏/版本的派生方式不同:
+ *   - 对象条目 {aes, audio}: 用官方下发的 audio 字段 (原神 7.1 method2)
+ *   - mask 字符串条目: HCA keycode 由 mask key 派生 (原神 7.1 之前全系列, 含
+ *     Video_Reunion_67; 与 wasm 流式解码器内部行为一致)
+ *   - 崩铁/绝区零音频是 ADX, 不会走到 HCA 分支
+ * 全零 mask key (明文约定) 不作为 keycode 使用。
+ */
+function resolveHcaAudioKey(key) {
+  if (key.audioHex)
+    return key.audioHex
+  if (key.mode === 'mask' && key.keyHex && key.keyHex !== '0000000000000000')
+    return key.keyHex
+  return ''
 }
 
 async function decodeAudioWav(chunks, { game = '', file = '', dataDir = null, chIndex = 0, log = () => {} } = {}) {
@@ -1596,7 +1606,7 @@ async function decodeAudioWav(chunks, { game = '', file = '', dataDir = null, ch
   const isHca = first.length > 4 && (first[0] & 0x7f) === 0x48 && (first[1] & 0x7f) === 0x43
   if (isHca) {
     const key = resolveKeyEntry(findUsmKey(dataDir, game, file))
-    const audioKey = key.audioHex || reunionHcaAudioKey(file, key)
+    const audioKey = resolveHcaAudioKey(key)
     if (!audioKey)
       throw new Error(`HCA 文件缺少音频 audioKey (keys.json 条目需含 audio 字段)`)
     return await decodeHcaWavInNode(concatBytes(audioChunks.map(c => c.data)), audioKey, log)
@@ -1764,11 +1774,13 @@ export async function usmBytesToMkv(usm, { game = '', file = '', dataDir = null,
 
   let audio
   if (isHca) {
-    // 4.5 method2: HCA (type56 子帧加密, keycode=audioKey) → wasm 解码出 WAV → PCM
-    if (!key.audioHex)
-      throw new Error(`method2 文件缺少音频 audioKey (keys.json 条目需含 audio 字段)`)
+    // HCA (type56 子帧加密, keycode=audioKey) → wasm 解码出 WAV → PCM
+    // keycode 来源随版本不同: 7.1 method2 用官方 audio 字段, 7.1 之前由 mask key 派生
+    const hcaAudioKey = resolveHcaAudioKey(key)
+    if (!hcaAudioKey)
+      throw new Error(`HCA 文件缺少音频 keycode (keys.json 条目需含 audio 字段或为非零 mask key)`)
     const hca = concatBytes(audioChunks.map(c => c.data))
-    const wav = await decodeHcaWavInNode(hca, key.audioHex, log)
+    const wav = await decodeHcaWavInNode(hca, hcaAudioKey, log)
     audio = parseWavPcm(wav)
     log(`[usm] 音频(HCA) chno=${audioChannel}: ${audio.channels}ch ${audio.sampleRate}Hz ${(audio.totalSamples / audio.sampleRate).toFixed(2)}s`)
   }
