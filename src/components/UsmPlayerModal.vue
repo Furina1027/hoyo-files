@@ -1051,7 +1051,10 @@ async function streamDirect(
       return
 
     received += value.byteLength
-    accumulatedUsmBytes.push(value)
+    // 累积原始 USM 只为崩铁在 wasm 流式结束后提取 ADX 音频;
+    // 原神/绝区零不需要, 省掉几百 MB 的 JS 堆占用
+    if (props.gameId === 'hkrpg')
+      accumulatedUsmBytes.push(value)
     if (total > 0) {
       progress.value = Math.min(99, Math.round((received / total) * 99))
       progressLabel.value = `${formatBytes(received)} / ${formatBytes(total)}`
@@ -1117,7 +1120,8 @@ async function streamChunks(
   const chunks = [...foundFile.chunks].sort((a, b) => a.offset - b.offset)
 
   await downloadChunks(chunks, chunkUrlPrefix, signal, async (decompressed, i, total) => {
-    accumulatedUsmBytes.push(decompressed)
+    if (props.gameId === 'hkrpg')
+      accumulatedUsmBytes.push(decompressed)
     const result = dec.push(decompressed)
     if (result.init_segment)
       sbQueue.append(result.init_segment as Uint8Array)

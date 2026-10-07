@@ -1369,8 +1369,10 @@ function decryptChunkAesCtr(data, aesKeyBytes, nonceBytes, frameTime) {
 
 /**
  * 提取并解密视频流 (mask / aes / 明文三模式共用)。
- * 返回 { format, stream, chunks, key } — chunks 是整份 USM 的解析结果,
+ * 返回 { format, stream, streamParts, chunks, key } — chunks 是整份 USM 的解析结果,
  * 调用方提取音频时直接复用, 不再重复 parseUsmChunks (300MB 级文件全量遍历)。
+ * stream 为连续缓冲 (仅 H.264/MPEG1 填充, 供解析器使用); VP9 一律用 streamParts
+ * 分段 (解密后的各 chunk), 免 concat、可直喂 ffmpeg 管道。
  */
 async function prepareVideoStream(usm, { game = '', file = '', dataDir = null, log = () => {} } = {}) {
   const { parseUsmChunks, makeVideoMask, decryptVideo, findVideoNonce } = await importUsmDemux()
@@ -1426,23 +1428,35 @@ async function prepareVideoStream(usm, { game = '', file = '', dataDir = null, l
     parts = videoChunks.map(c => c.data)
   }
 
-  const video = concatBytes(parts)
-  log(`[usm] 视频流 ${video.length} 字节`)
-
+  // 格式从第一个分段头判定; VP9 全程只需分段（喂 ffmpeg 管道）,
+  // H.264/MPEG1 解析器需要连续缓冲才 concat
+  const first = parts[0]
   let format = null
-  if (video[0] === 0x44 && video[1] === 0x4b && video[2] === 0x49 && video[3] === 0x46)
-    format = 'vp9'
-  else if (video[0] === 0 && video[1] === 0 && video[2] === 0 && video[3] === 1)
-    format = 'h264'
-  else if (video[0] === 0 && video[1] === 0 && video[2] === 1 && video[3] === 0xb3)
-    format = 'mpeg1'
+  if (first) {
+    if (first[0] === 0x44 && first[1] === 0x4b && first[2] === 0x49 && first[3] === 0x46)
+      format = 'vp9'
+    else if (first[0] === 0 && first[1] === 0 && first[2] === 0 && first[3] === 1)
+      format = 'h264'
+    else if (first[0] === 0 && first[1] === 0 && first[2] === 1 && first[3] === 0xb3)
+      format = 'mpeg1'
+  }
 
   if (!format) {
     if (key.mode !== 'plain')
       throw new Error('解密后不是可识别的视频流 (key 可能不正确)')
     throw new Error('视频已加密且未找到对应 key (需抓包获取)')
   }
-  return { format, stream: video, chunks, key }
+
+  let video = null
+  if (format !== 'vp9') {
+    video = concatBytes(parts)
+    log(`[usm] 视频流 ${video.length} 字节`)
+  }
+  else {
+    const total = parts.reduce((s, p) => s + p.length, 0)
+    log(`[usm] 视频流 ${total} 字节 (分段)`)
+  }
+  return { format, stream: video, streamParts: parts, chunks, key }
 }
 
 /** MPEG1 裸流 → MP4 (H.264): 借本机 ffmpeg 转码 (4.5 TV 类小视频为明文 MPEG1)。
@@ -1644,35 +1658,65 @@ async function decodeAudioWavs(chunks, { game = '', file = '', dataDir = null, c
 }
 
 async function runFfmpeg(args, log) {
+  await runFfmpegWithInput(args, null, log)
+}
+
+/** 运行 ffmpeg 并把 inputParts (Uint8Array[]) 逐段经 stdin 喂给 `-i pipe:0`。
+ *  背压: 写满等 drain; ffmpeg 提前退出时 EPIPE → kill 并由 exit code 路径报错。 */
+async function runFfmpegWithInput(args, inputParts, log) {
   const ffmpeg = await findFfmpeg()
   if (!ffmpeg)
     throw new Error('未找到 ffmpeg (VP9 7.1 导出需要; 可用 FFMPEG_PATH 指定)')
   const { spawn } = await import('node:child_process')
   await new Promise((resolve, reject) => {
-    const process = spawn(ffmpeg, args, { stdio: ['ignore', 'ignore', 'pipe'] })
+    const proc = spawn(ffmpeg, args, { stdio: ['pipe', 'ignore', 'pipe'] })
     let stderr = ''
-    process.stderr.on('data', data => { stderr += data.toString() })
-    process.once('error', reject)
-    process.once('exit', code => {
+    proc.stderr.on('data', data => { stderr += data.toString() })
+    let stdinErr = null
+    proc.stdin.on('error', (e) => { stdinErr = e })
+    proc.once('error', reject)
+    proc.once('exit', (code) => {
       if (code === 0)
         resolve()
       else
         reject(new Error(`ffmpeg 失败 (exit ${code}): ${stderr.slice(-500)}`))
     })
+    ;(async () => {
+      try {
+        if (inputParts) {
+          for (const part of inputParts) {
+            if (stdinErr)
+              throw stdinErr
+            if (!proc.stdin.write(part)) {
+              await Promise.race([
+                new Promise(r => proc.stdin.once('drain', r)),
+                new Promise(r => proc.once('exit', r)),
+              ])
+            }
+          }
+          proc.stdin.end()
+        }
+      }
+      catch (e) {
+        try { proc.kill() } catch {}
+        reject(e)
+      }
+    })()
   })
   log(`[usm] ffmpeg 完成: ${args.at(-1)}`)
 }
 
-async function muxVp9WithFfmpeg(ivf, audio, container, { log = () => {} } = {}) {
+async function muxVp9WithFfmpeg(videoParts, audio, container, { log = () => {} } = {}) {
   const os = await import('node:os')
   const stamp = `${Date.now()}_${Math.random().toString(16).slice(2)}`
-  const ivfPath = path.join(os.tmpdir(), `hoyo-files_${stamp}.ivf`)
   const outputPath = path.join(os.tmpdir(), `hoyo-files_${stamp}.${container === 'webm' ? 'webm' : 'mkv'}`)
   const tracks = (Array.isArray(audio) ? audio : audio ? [{ channel: 0, wav: audio }] : []).filter(track => track?.wav)
   const wavPaths = tracks.map((_, index) => path.join(os.tmpdir(), `hoyo-files_${stamp}_${index}.wav`))
+  const parts = Array.isArray(videoParts) ? videoParts : [videoParts]
   try {
-    fs.writeFileSync(ivfPath, Buffer.from(ivf))
-    const args = ['-y', '-i', ivfPath]
+    // 解密后的视频分段经 stdin 直喂 ffmpeg (IVF), 省掉临时 IVF 文件的整遍写+读;
+    // 分段也免去解密流的 concat
+    const args = ['-y', '-f', 'ivf', '-i', 'pipe:0']
     for (let index = 0; index < tracks.length; index++) {
       fs.writeFileSync(wavPaths[index], Buffer.from(tracks[index].wav))
       args.push('-i', wavPaths[index])
@@ -1689,18 +1733,18 @@ async function muxVp9WithFfmpeg(ivf, audio, container, { log = () => {} } = {}) 
         args.push(`-metadata:s:a:${index}`, `language=${languages[tracks[index].channel] ?? 'und'}`)
     }
     args.push(outputPath)
-    await runFfmpeg(args, log)
+    await runFfmpegWithInput(args, parts, log)
     return new Uint8Array(fs.readFileSync(outputPath))
   }
   finally {
-    for (const filePath of [ivfPath, ...wavPaths, outputPath]) {
+    for (const filePath of [...wavPaths, outputPath]) {
       try { fs.unlinkSync(filePath) } catch {}
     }
   }
 }
 
 export async function usmBytesToWebm(usm, { game = '', file = '', dataDir = null, chIndex = null, includeAudio = true, log = () => {} } = {}) {
-  const { format, stream, chunks } = await prepareVideoStream(usm, { game, file, dataDir, log })
+  const { format, streamParts, chunks } = await prepareVideoStream(usm, { game, file, dataDir, log })
   const keyMode = resolveKeyEntry(findUsmKey(dataDir, game, file)).mode
   // 67_test 的历史回退源是旧 mask VP9；与 7.1 AES VP9 共用同一条服务器解密播放路径。
   // 崩铁 2.3 之前的 LOOP 系列是**未加密** VP9/IVF（key 库全 0 约定值），此前被这条
@@ -1712,7 +1756,7 @@ export async function usmBytesToWebm(usm, { game = '', file = '', dataDir = null
   if (format !== 'vp9' || (keyMode !== 'aes' && keyMode !== 'mask' && keyMode !== 'plain'))
     throw new Error('WebM 导出仅支持 VP9 视频')
   const audio = includeAudio ? await decodeAudioWavs(chunks, { game, file, dataDir, chIndex, log }) : []
-  return await muxVp9WithFfmpeg(stream, audio, 'webm', { log })
+  return await muxVp9WithFfmpeg(streamParts, audio, 'webm', { log })
 }
 
 /**
@@ -1730,13 +1774,13 @@ export async function usmBytesToMkv(usm, { game = '', file = '', dataDir = null,
   const { muxMkv } = await import(pathToFileURL(path.join(__dirname, '../src/utils/mkvmux.ts')).href)
 
   // ---- 视频 ----
-  const { format, stream: video, chunks, key } = await prepareVideoStream(usm, { game, file, dataDir, log })
+  const { format, stream: video, streamParts, chunks, key } = await prepareVideoStream(usm, { game, file, dataDir, log })
   if (format === 'vp9') {
     // 同 usmBytesToWebm: 明文 VP9(崩铁 2.3 前的 LOOP 系列) 也走 ffmpeg 封装
     if (key.mode === 'aes' || key.mode === 'mask' || key.mode === 'plain') {
       const audio = await decodeAudioWavs(chunks, { game, file, dataDir, chIndex, log })
       // 与 H.264 分支一致, 统一返回分段数组 (ffmpeg 输出为单段)
-      return [await muxVp9WithFfmpeg(video, audio, 'mkv', { log })]
+      return [await muxVp9WithFfmpeg(streamParts, audio, 'mkv', { log })]
     }
     throw new Error('VP9 视频请使用流式播放')
   }

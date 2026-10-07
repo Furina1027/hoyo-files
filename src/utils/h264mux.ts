@@ -165,9 +165,11 @@ export function splitAnnexB(data: Uint8Array): Uint8Array[] {
   while (start !== -1) {
     const end = start + (data[start + 2] === 0 ? 4 : 3)
     // 一次前向扫描同时给出本 NAL 的终点和下一个 start code,
-    // 不再像旧实现那样每个 start code 被前后两轮各扫一遍
+    // 不再像旧实现那样每个 start code 被前后两轮各扫一遍。
+    // subarray 而非 slice: NAL 只被下游读取/拷贝（frameData/avcC）,
+    // 零拷贝视图省掉一整遍视频流的复制。
     const next = findStartCode(data, end, len)
-    nalus.push(data.slice(end, next === -1 ? len : next))
+    nalus.push(data.subarray(end, next === -1 ? len : next))
     start = next
   }
   return nalus
@@ -360,20 +362,6 @@ export function annexbToMp4(h264: Uint8Array, fallbackFps = 30): Uint8Array {
   const ftyp = box('ftyp', boxStr('isom'), u32(0x200), boxStr('isom'), boxStr('iso2'), boxStr('avc1'), boxStr('mp41'))
 
   const mdatSize = frameData.reduce((s, f) => s + f.length, 0)
-  const mdat = (() => {
-    const buf = new Uint8Array(8 + mdatSize)
-    new DataView(buf.buffer).setUint32(0, 8 + mdatSize)
-    buf[4] = 'm'.charCodeAt(0)
-    buf[5] = 'd'.charCodeAt(0)
-    buf[6] = 'a'.charCodeAt(0)
-    buf[7] = 't'.charCodeAt(0)
-    let off = 8
-    for (const f of frameData) {
-      buf.set(f, off)
-      off += f.length
-    }
-    return buf
-  })()
 
   // 回填 stco (ftyp + moov + mdat 头 8 字节)
   const moovOffset = ftyp.length + moov.length + 8
@@ -389,9 +377,21 @@ export function annexbToMp4(h264: Uint8Array, fallbackFps = 30): Uint8Array {
   const trak2 = box('trak', tkhd, mdia2)
   const moov2 = box('moov', mvhd, trak2)
 
-  const out = new Uint8Array(ftyp.length + moov2.length + mdat.length)
+  // 一次性装配 ftyp + moov2 + mdat: mdat 头直接写进最终缓冲、帧数据紧跟其后,
+  // 省掉「先拼独立 mdat 再整体拷进 out」的一整遍视频流复制
+  const out = new Uint8Array(ftyp.length + moov2.length + 8 + mdatSize)
   out.set(ftyp, 0)
   out.set(moov2, ftyp.length)
-  out.set(mdat, ftyp.length + moov2.length)
+  const mdatOff = ftyp.length + moov2.length
+  new DataView(out.buffer, out.byteOffset + mdatOff, 8).setUint32(0, 8 + mdatSize)
+  out[mdatOff + 4] = 'm'.charCodeAt(0)
+  out[mdatOff + 5] = 'd'.charCodeAt(0)
+  out[mdatOff + 6] = 'a'.charCodeAt(0)
+  out[mdatOff + 7] = 't'.charCodeAt(0)
+  let mdatCursor = mdatOff + 8
+  for (const f of frameData) {
+    out.set(f, mdatCursor)
+    mdatCursor += f.length
+  }
   return out
 }
