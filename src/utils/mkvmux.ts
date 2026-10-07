@@ -99,8 +99,12 @@ function simpleBlock(track: number, timecodeMs: number, isKeyframe: boolean, pay
 // ---------- 主入口 ----------
 
 export interface MkvVideoInfo {
-  /** 每帧一个 access unit (H.264: Annex-B 格式含 start code, 内部转 AVCC; VP9: 原始 VP9 帧) */
+  /** 每帧一个 access unit, Annex-B 格式 (含 start code, 内部转 AVCC); VP9: 原始 VP9 帧。
+   *  与 framesNals 二选一: 已有切好的 NAL 组时直接给 framesNals, 省掉
+   *  「拼 start code → muxer 里再扫描拆掉」的两遍全帧处理。 */
   frames: Uint8Array[]
+  /** (可选) 每帧的 NAL 组 (不含 start code)。提供时忽略 frames 的 Annex-B 扫描。 */
+  framesNals?: Uint8Array[][]
   width: number
   height: number
   fps: number
@@ -117,13 +121,19 @@ export interface MkvAudioInfo {
   channels: number
 }
 
-/** 组装完整 MKV 字节流 */
-export function muxMkv(video: MkvVideoInfo, audio: MkvAudioInfo | null): Uint8Array {
-  const { frames, width, height, fps, codecPrivate } = video
+/**
+ * 组装 MKV。返回字节分段 [EBML头, Segment(Info+Tracks), Cluster...] —
+ * 段与段首尾相接即完整文件 (EBML 元素可拼接), 调用方可逐段写出/下载,
+ * 免掉一次全量 concat。
+ */
+export function muxMkv(video: MkvVideoInfo, audio: MkvAudioInfo | null): Uint8Array[] {
+  const { width, height, fps, codecPrivate } = video
+  const nals = video.framesNals
+  const frameCount = nals ? nals.length : video.frames.length
   const frameDurationMs = Math.round(1000 / fps)
 
   // 视频总时长 (ms), 最小 1 帧
-  const videoDurationMs = frames.length * frameDurationMs
+  const videoDurationMs = frameCount * frameDurationMs
   // 音频总时长 (ms)
   const audioDurationMs = audio
     ? Math.round((audio.pcm.length / audio.channels / audio.sampleRate) * 1000)
@@ -169,9 +179,9 @@ export function muxMkv(video: MkvVideoInfo, audio: MkvAudioInfo | null): Uint8Ar
   const numClusters = Math.ceil(durationMs / clusterSpanMs)
 
   // H.264: 每帧 Annex-B → AVCC (4 字节长度前缀), Matroska 标准存储格式
-  const videoBlocks = video.codec === 'h264'
-    ? frames.map(annexBToAvcc)
-    : frames
+  const videoBlocks: Uint8Array[] = video.codec === 'h264'
+    ? (nals ? nals.map(nalsToAvcc) : video.frames.map(annexBToAvcc))
+    : video.frames
 
   for (let ci = 0; ci < numClusters; ci++) {
     const clusterStartMs = ci * clusterSpanMs
@@ -183,8 +193,10 @@ export function muxMkv(video: MkvVideoInfo, audio: MkvAudioInfo | null): Uint8Ar
       if (frameTimeMs < clusterStartMs || frameTimeMs >= clusterStartMs + clusterSpanMs)
         continue
       const tc = frameTimeMs - clusterStartMs
-      // I 帧判定: 首帧 (第 0 帧) 或包含 IDR (nal type 5)
-      const isKey = isKeyframeNal(frames[fi])
+      // I 帧判定: 含 IDR (nal type 5)
+      const isKey = nals
+        ? nals[fi].some(n => (n[0] & 0x1f) === 5)
+        : isKeyframeNal(video.frames[fi])
       blocks.push(simpleBlock(1, tc, isKey, videoBlocks[fi]))
     }
 
@@ -196,12 +208,7 @@ export function muxMkv(video: MkvVideoInfo, audio: MkvAudioInfo | null): Uint8Ar
       if (endSample > startSample) {
         const slice = new Int16Array((endSample - startSample) * audio.channels)
         slice.set(audio.pcm.subarray(startSample * audio.channels, endSample * audio.channels))
-        const bytes = new Uint8Array(slice.length * 2)
-        for (let i = 0; i < slice.length; i++) {
-          bytes[i * 2] = slice[i] & 0xff
-          bytes[i * 2 + 1] = (slice[i] >> 8) & 0xff
-        }
-        blocks.push(simpleBlock(2, 0, true, bytes))
+        blocks.push(simpleBlock(2, 0, true, pcmToBytes(slice)))
       }
     }
 
@@ -232,12 +239,35 @@ export function muxMkv(video: MkvVideoInfo, audio: MkvAudioInfo | null): Uint8Ar
     ebmlStr(0x5741, 'hoyo-files'),       // WritingApp
   ]))
 
-  const segment = ebml(0x18538067, concat([info, tracks, ...clusters]))
+  // 分段返回: EBML 头 / Segment 头(id+size) / Info+Tracks / 各 Cluster。
+  // Segment 的 payload 必须包含全部 Cluster, 但 size vint 只在头部写一次,
+  // 因此先算总长拼出头部, Clusters 保持独立分段 (拼接即完整文件, 字节与
+  // 整体 concat 完全一致), 省掉一次全量拷贝。
+  const infoTracks = concat([info, tracks])
+  const clustersLen = clusters.reduce((s, c) => s + c.length, 0)
+  const segHead = new Uint8Array(4 + writeVint(infoTracks.length + clustersLen).length)
+  segHead[0] = 0x18 // Segment id (0x18538067) 的 4 字节 EBML 编码
+  segHead[1] = 0x53
+  segHead[2] = 0x80
+  segHead[3] = 0x67
+  segHead.set(writeVint(infoTracks.length + clustersLen), 4)
+  return [ebmlRoot, segHead, infoTracks, ...clusters]
+}
 
-  const out = new Uint8Array(ebmlRoot.length + segment.length)
-  out.set(ebmlRoot, 0)
-  out.set(segment, ebmlRoot.length)
-  return out
+/** 平台是否小端 (现实中所有 JS 平台均如此); 非小端走逐样本回退 */
+const IS_LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1
+
+/** 交错 PCM Int16 → LE 字节 (小端平台直接按内存字节拷贝, 免逐样本读写) */
+function pcmToBytes(pcm: Int16Array): Uint8Array {
+  const bytes = new Uint8Array(pcm.length * 2)
+  if (IS_LITTLE_ENDIAN)
+    bytes.set(new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength))
+  else {
+    const dv = new DataView(bytes.buffer)
+    for (let i = 0; i < pcm.length; i++)
+      dv.setInt16(i * 2, pcm[i], true)
+  }
+  return bytes
 }
 
 /** Annex-B (00 00 01 start code) → AVCC (4 字节长度前缀) */
@@ -269,7 +299,11 @@ function annexBToAvcc(frame: Uint8Array): Uint8Array {
     nalus.push(frame.slice(end, next))
     i = next
   }
+  return nalsToAvcc(nalus)
+}
 
+/** NAL 组 → AVCC (4 字节长度前缀) */
+function nalsToAvcc(nalus: Uint8Array[]): Uint8Array {
   const out = new Uint8Array(nalus.reduce((s, n) => s + 4 + n.length, 0))
   let off = 0
   for (const nal of nalus) {
@@ -477,36 +511,32 @@ function buildAudioClusters(audio: MkvAudioInfo): Uint8Array[] {
       break
     const slice = new Int16Array((endSample - startSample) * channels)
     slice.set(pcm.subarray(startSample * channels, endSample * channels))
-    const bytes = new Uint8Array(slice.length * 2)
-    for (let i = 0; i < slice.length; i++) {
-      bytes[i * 2] = slice[i] & 0xff
-      bytes[i * 2 + 1] = (slice[i] >> 8) & 0xff
-    }
     const tc = ci * clusterSpanMs
     clusters.push(ebml(0x1F43B675, concat([
       ebmlUint(0xE7, tc),
-      simpleBlock(2, 0, true, bytes),
+      simpleBlock(2, 0, true, pcmToBytes(slice)),
     ])))
   }
   return clusters
 }
 
-/** 判断 H.264 NAL 是否为关键帧 (含 IDR, nal type 5) */
+/** 判断 H.264 NAL 是否为关键帧 (含 IDR, nal type 5)。
+ *  只扫描到第一个 VCL NAL (type 1-5) 为止 — AUD/SPS/PPS/SEI 之后紧跟的就是
+ *  本帧的 VCL; 旧实现对非关键帧要扫完整帧 (几十~几百 KB) 才能返回 false。 */
 function isKeyframeNal(frame: Uint8Array): boolean {
-  // 扫描 start code 之后的 nal header
   let i = 0
-  while (i + 3 < frame.length) {
-    if (frame[i] === 0 && frame[i + 1] === 0 && frame[i + 2] === 1) {
-      const t = frame[i + 3] & 0x1f
-      if (t === 5)
-        return true
-      i += 4
-    }
-    else if (frame[i] === 0 && frame[i + 1] === 0 && frame[i + 2] === 0 && frame[i + 3] === 1) {
-      const t = frame[i + 4] & 0x1f
-      if (t === 5)
-        return true
-      i += 5
+  const len = frame.length
+  while (i + 3 < len) {
+    let scLen = 0
+    if (frame[i] === 0 && frame[i + 1] === 0 && frame[i + 2] === 1)
+      scLen = 3
+    else if (frame[i] === 0 && frame[i + 1] === 0 && frame[i + 2] === 0 && frame[i + 3] === 1)
+      scLen = 4
+    if (scLen) {
+      const t = frame[i + scLen] & 0x1f
+      if (t >= 1 && t <= 5)
+        return t === 5
+      i += scLen + 1
     }
     else {
       i++

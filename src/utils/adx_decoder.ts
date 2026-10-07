@@ -10,6 +10,8 @@
  * 崩铁 USM 的 @SFA 音频块为 ADX 格式 (非 HCA), 需本解码器处理
  */
 
+import type { UsmChunk } from './usm_demux'
+
 export interface AdxDecodeResult {
   /** 交错 PCM (Int16, L/R/L/R...), 与 Web Audio API createBuffer 兼容 */
   pcm: Int16Array
@@ -103,22 +105,17 @@ function interleave(planar: Int16Array, channels: number, totalSamples: number, 
 }
 
 /**
- * 从 USM 字节流提取指定 chno 的 ADX 音频流
- *
- * @param usm 完整 USM 字节
- * @param chno 音频通道号 (0=第一语言, 1=第二语言, ...)
- * @param keyHex 16 位 hex key (全零=不加密)
- * @param decrypt 是否应用 ADX mask；HCA 原始流必须传 false
- * @returns ADX 字节流 (可直接传给 decodeAdx)
+ * 从已解析的 USM chunk 列表提取指定 chno 的 ADX 音频流。
+ * 供调用方对整份 USM 只 parseUsmChunks 一次后按通道复用。
  */
-export async function extractAdxFromUsm(usm: Uint8Array, chno: number, keyHex: string, decrypt = true): Promise<Uint8Array> {
-  const { parseUsmChunks, makeAudioMask, decryptAudio } = await import('./usm_demux.ts')
+export async function extractAdxFromChunks(chunks: UsmChunk[], chno: number, keyHex: string, decrypt = true): Promise<Uint8Array> {
+  const { makeAudioMask, decryptAudio } = await import('./usm_demux.ts')
 
-  const chunks = parseUsmChunks(usm)
+  const parts = chunks
     .filter(c => c.type === '@SFA' && c.chno === chno)
     .map(c => c.data)
 
-  if (chunks.length === 0)
+  if (parts.length === 0)
     throw new Error(`未找到 chno=${chno} 的 @SFA 音频块`)
 
   // 加密时解密音频 (非零 key)
@@ -126,8 +123,8 @@ export async function extractAdxFromUsm(usm: Uint8Array, chno: number, keyHex: s
   const audioMask = needDecrypt ? makeAudioMask(BigInt(`0x${keyHex}`)) : null
 
   const processed = audioMask
-    ? chunks.map(c => decryptAudio(c, audioMask))
-    : chunks
+    ? parts.map(c => decryptAudio(c, audioMask))
+    : parts
 
   const total = processed.reduce((s, p) => s + p.length, 0)
   const out = new Uint8Array(total)
@@ -137,4 +134,18 @@ export async function extractAdxFromUsm(usm: Uint8Array, chno: number, keyHex: s
     off += p.length
   }
   return out
+}
+
+/**
+ * 从 USM 字节流提取指定 chno 的 ADX 音频流
+ *
+ * @param usm 完整 USM 字节
+ * @param chno 音频通道号 (0=第一语言, 1=第二语言, ...)
+ * @param keyHex 16 位 hex key (全零=不加密)
+ * @param decrypt 是否应用 ADX mask；HCA 原始流必须传 false
+ * @returns ADX 字节流 (可直接传给 decodeAdx)
+ */
+export async function extractAdxFromUsm(usm: Uint8Array, chno: number, keyHex: string, decrypt = true): Promise<Uint8Array> {
+  const { parseUsmChunks } = await import('./usm_demux.ts')
+  return extractAdxFromChunks(parseUsmChunks(usm), chno, keyHex, decrypt)
 }

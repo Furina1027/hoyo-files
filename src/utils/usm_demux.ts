@@ -148,12 +148,27 @@ export function makeAudioMask(key: bigint): Uint8Array {
  * 音频数据解密 (PyCriUsm fast_core.pyx crypt_audio):
  *   简单 XOR (无反馈), 从 0x140 偏移开始
  *   小于等于 0x140 字节的块不解密 (原样保留)
+ *
+ * 0x140 是掩码长度 0x20 的整数倍, 加密区按 32 字节组用 Uint32Array 整块异或
+ * (XOR 与字端序无关), 末尾不足一组的部分逐字节处理。
  */
 export function decryptAudio(data: Uint8Array, audioMask: Uint8Array): Uint8Array {
   const out = data.slice()
-  if (out.length <= 0x140)
+  const len = out.length
+  if (len <= 0x140)
     return out
-  for (let i = 0x140; i < out.length; i++)
+  const start = 0x140
+  const fullGroups = Math.floor((len - start) / 0x20)
+  if (fullGroups > 0) {
+    const outU32 = new Uint32Array(out.buffer, out.byteOffset + start, fullGroups * 8)
+    const maskU32 = new Uint32Array(audioMask.buffer, audioMask.byteOffset, 8)
+    for (let g = 0; g < fullGroups; g++) {
+      const off = g * 8
+      for (let w = 0; w < 8; w++)
+        outU32[off + w] ^= maskU32[w]
+    }
+  }
+  for (let i = start + fullGroups * 0x20; i < len; i++)
     out[i] ^= audioMask[i & 0x1f]
   return out
 }
@@ -162,6 +177,11 @@ export function decryptAudio(data: Uint8Array, audioMask: Uint8Array): Uint8Arra
  * 视频数据反馈式解密 (与 PyCriUsm / GI MaskVideo 一致):
  *   mask 初始为 mask2, 从 0x40+0x100 起: data ^= mask[p]; mask[p] = data ^ mask2[p]
  *   然后 mask 换为 mask1, 前 0x100 字节: mask[p] ^= data[0x140+i]; data ^= mask[p]
+ *
+ * 两段循环的掩码更新都以 32 字节为周期且组内各字节只碰一次, 因此按 32 字节组
+ * 向量化: 组内用 Uint32Array 整块异或 (等价于逐字节), 组间沿用反馈链。
+ * out 来自 data.slice(), buffer 偏移为 0 且 0x40/0x100/0x140 都是 4 的倍数,
+ * Uint32Array 视图对齐成立。
  */
 export function decryptVideo(data: Uint8Array, mask1: Uint8Array, mask2: Uint8Array): Uint8Array {
   const out = data.slice()
@@ -169,17 +189,45 @@ export function decryptVideo(data: Uint8Array, mask1: Uint8Array, mask2: Uint8Ar
   if (size < 0x200)
     return out
 
+  // ---- 第一段: i ∈ [0x100, size), 操作 out[0x40+i], 起点即 out[0x140] ----
   const mask = new Uint8Array(mask2)
-  for (let i = 0x100; i < size; i++) {
-    const p = i & 0x1F
-    out[0x40 + i] ^= mask[p]
-    mask[p] = out[0x40 + i] ^ mask2[p]
+  const base = 0x140 // 0x40 + 0x100
+  const bodyLen = size - 0x100
+  const fullGroups = Math.floor(bodyLen / 0x20)
+  if (fullGroups > 0) {
+    const outU32 = new Uint32Array(out.buffer, out.byteOffset + base, fullGroups * 8)
+    const maskU32 = new Uint32Array(mask.buffer, mask.byteOffset, 8)
+    const m2U32 = new Uint32Array(mask2.buffer, mask2.byteOffset, 8)
+    for (let g = 0; g < fullGroups; g++) {
+      const off = g * 8
+      for (let w = 0; w < 8; w++) {
+        // 等价于: out ^= mask; mask = out ^ mask2
+        const x = outU32[off + w] ^ maskU32[w]
+        outU32[off + w] = x
+        maskU32[w] = x ^ m2U32[w]
+      }
+    }
   }
-  const m1 = new Uint8Array(mask1)
-  for (let i = 0; i < 0x100; i++) {
+  const m2 = mask2
+  for (let i = fullGroups * 0x20; i < bodyLen; i++) {
     const p = i & 0x1F
-    m1[p] ^= out[0x140 + i]
-    out[0x40 + i] ^= m1[p]
+    out[base + i] ^= mask[p]
+    mask[p] = out[base + i] ^ m2[p]
+  }
+
+  // ---- 第二段: 前 0x100 字节, 反馈源是第一段输出 out[0x140..0x240) ----
+  const m1 = new Uint8Array(mask1)
+  const m1U32 = new Uint32Array(m1.buffer, m1.byteOffset, 8)
+  const fbU32 = new Uint32Array(out.buffer, out.byteOffset + 0x140, 0x100 / 4) // 读: 第一段输出
+  const headU32 = new Uint32Array(out.buffer, out.byteOffset + 0x40, 0x100 / 4) // 写: 0x40 起的第一个 0x100 字节
+  for (let g = 0; g < 0x100 / 0x20; g++) {
+    const off = g * 8
+    for (let w = 0; w < 8; w++) {
+      // 等价于: m1[p] ^= out[0x140 + i]; out[0x40 + i] ^= m1[p]
+      const k = m1U32[w] ^ fbU32[off + w]
+      m1U32[w] = k
+      headU32[off + w] ^= k
+    }
   }
   return out
 }

@@ -206,7 +206,12 @@ export const useDownload = defineStore('download', () => {
     let foundFile: ParsedFile | null = null
     let chunkUrlPrefix = ''
 
-    for (const m of manifests) {
+    // 游戏文件基本都在 matching_field === 'game' 的 manifest 里, 排到最前
+    // (排序稳定保序), 避免串行扫描时拉完上百个无关 manifest
+    const orderedManifests = [...manifests].sort(
+      (a, b) => (a.matching_field === 'game' ? 0 : 1) - (b.matching_field === 'game' ? 0 : 1),
+    )
+    for (const m of orderedManifests) {
       const cacheKey = `${gameId}_${version}_${m.manifest.id}`
       const url = `${m.manifest_download.url_prefix}/${m.manifest.id}`
       const uncompressedSize = Number(m.manifest.uncompressed_size)

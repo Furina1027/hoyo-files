@@ -45,7 +45,6 @@ const emit = defineEmits<{
 }>()
 
 const currentPath = ref<string[]>([])
-const searchQuery = ref('')
 const changeTypeFilter = ref<Exclude<ChangeType, 'unchanged'> | null>(null)
 const selectedFile = ref<BrowserFileItem | null>(null)
 
@@ -55,6 +54,24 @@ const isDiffMode = computed(() => !!props.sourceB)
 const audioOptions = computed<FileBrowserAudioOption[]>(() => props.sourceA.audioOptions ?? props.sourceB?.audioOptions ?? [])
 const isLoading = computed(() => props.sourceA.isLoading || !!props.sourceB?.isLoading)
 const error = computed(() => props.sourceA.error || props.sourceB?.error || null)
+
+// files 经这层 computed 解引用: sourceA 对象在父组件里每次状态变化都会重建,
+// 但其中的 files 数组引用是稳定的 (父组件单独缓存了合并结果)。browserFiles
+// /currentDirItems 只依赖数组引用, 不会因 loading 等状态翻转而全量重排。
+const filesA = computed(() => props.sourceA.files)
+const filesB = computed(() => props.sourceB?.files ?? [])
+
+const searchQuery = ref('')
+// 搜索防抖: 上万条文件的全量过滤每敲一个键跑一遍很浪费
+const debouncedQuery = ref('')
+let searchDebounceTimer: ReturnType<typeof setTimeout> | null = null
+watch(searchQuery, (val) => {
+  if (searchDebounceTimer)
+    clearTimeout(searchDebounceTimer)
+  searchDebounceTimer = setTimeout(() => {
+    debouncedQuery.value = val
+  }, 150)
+})
 
 // 只在"数据集真的换了"时重置浏览状态。
 // 原来这里 watch 的是 [version, files, version, files] —— getter 每次返回新数组,
@@ -75,6 +92,7 @@ watch(
   () => {
     currentPath.value = []
     searchQuery.value = ''
+    debouncedQuery.value = ''
     changeTypeFilter.value = null
     selectedFile.value = null
   },
@@ -82,7 +100,7 @@ watch(
 
 const browserFiles = computed<BrowserFileItem[]>(() => {
   if (!isDiffMode.value) {
-    return [...props.sourceA.files]
+    return [...filesA.value]
       .sort((a, b) => a.remoteName.localeCompare(b.remoteName))
       .map(file => ({
         remoteName: file.remoteName,
@@ -96,8 +114,8 @@ const browserFiles = computed<BrowserFileItem[]>(() => {
   if (!sourceB)
     return []
 
-  const mapA = new Map(props.sourceA.files.map(file => [file.remoteName, file]))
-  const mapB = new Map(sourceB.files.map(file => [file.remoteName, file]))
+  const mapA = new Map(filesA.value.map(file => [file.remoteName, file]))
+  const mapB = new Map(filesB.value.map(file => [file.remoteName, file]))
   const result: BrowserFileItem[] = []
 
   for (const [remoteName, fileA] of mapA) {
@@ -124,12 +142,12 @@ const browserFiles = computed<BrowserFileItem[]>(() => {
 })
 
 const fileStats = computed(() => {
-  if (isDiffMode.value || !props.sourceA.files.length)
+  if (isDiffMode.value || !filesA.value.length)
     return null
 
   return {
-    count: props.sourceA.files.length,
-    totalSize: props.sourceA.files.reduce((sum, file) => sum + file.fileSize, 0),
+    count: filesA.value.length,
+    totalSize: filesA.value.reduce((sum, file) => sum + file.fileSize, 0),
   }
 })
 
@@ -346,11 +364,11 @@ const currentDirItems = computed(() => {
 })
 
 const shouldUseFlatList = computed(() => {
-  return !!searchQuery.value.trim() || !!(isDiffMode.value && changeTypeFilter.value)
+  return !!debouncedQuery.value.trim() || !!(isDiffMode.value && changeTypeFilter.value)
 })
 
 const flatResults = computed<BrowserFileItem[]>(() => {
-  const query = searchQuery.value.trim().toLowerCase()
+  const query = debouncedQuery.value.trim().toLowerCase()
   if (!shouldUseFlatList.value)
     return []
 

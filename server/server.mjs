@@ -15,9 +15,10 @@ import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
+import { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 
-import { assembleUsmFromChunks, detectUsmBytes, detectUsmFormat, downloadPredownloadFiles, gameStatus, predownloadChunkInfo, predownloadDir, predownloadSummary, refreshGame, updateUsmHistory, usmBytesToMkv, usmBytesToMp4, usmBytesToWebm, usmToMp4 } from './refresh.mjs'
+import { assembleUsmFromChunks, detectUsmBytes, detectUsmFormat, downloadPredownloadFiles, gameStatus, predownloadChunkInfo, predownloadDir, predownloadSummary, readJsonCached, refreshGame, updateUsmHistory, usmBytesToMkv, usmBytesToMp4, usmBytesToWebm, usmToMp4 } from './refresh.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -104,7 +105,7 @@ function relWithinVideoRoots(file, dirs) {
 }
 
 /**
- * 本地视频根目录的 USM 索引缓存: rootDir -> { at, byName, byLower }。
+ * 本地游戏目录的 USM 文件索引缓存: rootDir -> { at, byName, byLower }。
  * 递归兜底（绝区零等分层目录）改为先建一次索引，避免「每个文件都遍历整棵树」。
  * 用短 TTL 而非永久缓存，游戏热更/删除文件后最多 30 秒自行失效。
  */
@@ -161,6 +162,34 @@ function localRootKind(sub) {
   return String(sub).includes('Persistent') ? 'Persistent' : 'StreamingAssets'
 }
 
+async function pathExists(p) {
+  try {
+    await fs.promises.stat(p)
+    return true
+  }
+  catch {
+    return false
+  }
+}
+
+/**
+ * 有限并发地跑 fn(items[i], i)，保持结果顺序。
+ * /api/usm-local-files 一次几百个路径的探测用，避免 Promise.all 全量并发
+ * 打爆磁盘，也避免纯串行把事件循环外的等待时间拉长。
+ */
+async function mapPool(items, limit, fn) {
+  const results = new Array(items.length)
+  let next = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++
+      results[i] = await fn(items[i], i)
+    }
+  })
+  await Promise.all(workers)
+  return results
+}
+
 /**
  * 定位本地游戏里的 USM 文件 —— 只探测存在性，不读字节
  * （批量探测数百个文件时，读盘代价不可接受）。
@@ -171,7 +200,7 @@ function localRootKind(sub) {
  *
  * 返回 { path, root, kind, how } 或 null。
  */
-function locateLocalUsm(game, file, customRoot = null) {
+async function locateLocalUsm(game, file, customRoot = null) {
   const root = customRoot || GAME_DIRS[game]
   const dirs = GAME_VIDEO_DIRS[game]
   if (!root || !dirs)
@@ -188,28 +217,21 @@ function locateLocalUsm(game, file, customRoot = null) {
   if (rel) {
     for (const sub of dirs) {
       const p = path.join(root, sub, rel)
-      try {
-        if (fs.existsSync(p))
-          return hit(p, sub, '')
-      } catch { /* 忽略 */ }
+      if (await pathExists(p))
+        return hit(p, sub, '')
     }
   }
   // 2) 根内按文件名直查
   for (const sub of dirs) {
     const p = path.join(root, sub, base)
-    try {
-      if (fs.existsSync(p))
-        return hit(p, sub, '')
-    } catch { /* 忽略 */ }
+    if (await pathExists(p))
+      return hit(p, sub, '')
   }
   // 3) 递归兜底（分层目录）
   for (const sub of dirs) {
     const rootDir = path.join(root, sub)
-    try {
-      if (!fs.existsSync(rootDir))
-        continue
-    }
-    catch { continue }
+    if (!(await pathExists(rootDir)))
+      continue
     const { byName, byLower } = localDirIndex(rootDir)
     const hits = byName.get(base) ?? byLower.get(base.toLowerCase()) ?? []
     if (!hits.length)
@@ -224,43 +246,112 @@ function locateLocalUsm(game, file, customRoot = null) {
   return null
 }
 
-function fetchLocalUsm(game, file, log = () => {}, customRoot = null) {
-  const found = locateLocalUsm(game, file, customRoot)
+/**
+ * 本地 USM 完整字节缓存: 播放/导出一次会话里同一文件会被 usm-detect →
+ * usm-webm/usm-mp4 → usm-proxy(音频提取) 依次完整读取，几百 MB 的文件
+ * 每次都 readFileSync 既慢又阻塞。键含 mtime/size，游戏热更替换文件后自动失效。
+ * 只放最近 2 个文件且总量受限；缓存条目被调用方只读（解密/解析均先拷贝），共享安全。
+ */
+const LOCAL_USM_CACHE_MAX_ENTRIES = 2
+const LOCAL_USM_CACHE_MAX_BYTES = 1.5 * 1024 * 1024 * 1024
+const localUsmCache = new Map() // key -> Uint8Array
+
+function localUsmCacheKey(p, stat) {
+  return `${p}|${stat.mtimeMs}|${stat.size}`
+}
+
+function localUsmCacheGet(key) {
+  const hit = localUsmCache.get(key)
+  if (!hit)
+    return null
+  // LRU 触碰: 删除再插入，保持 Map 迭代顺序 = 最旧在前
+  localUsmCache.delete(key)
+  localUsmCache.set(key, hit)
+  return hit
+}
+
+function localUsmCachePut(key, bytes) {
+  localUsmCache.set(key, bytes)
+  let total = 0
+  for (const v of localUsmCache.values())
+    total += v.length
+  while (localUsmCache.size > LOCAL_USM_CACHE_MAX_ENTRIES
+    || (total > LOCAL_USM_CACHE_MAX_BYTES && localUsmCache.size > 1)) {
+    const oldest = localUsmCache.keys().next().value
+    const evicted = localUsmCache.get(oldest)
+    localUsmCache.delete(oldest)
+    total -= evicted.length
+  }
+}
+
+async function fetchLocalUsm(game, file, log = () => {}, customRoot = null) {
+  const found = await locateLocalUsm(game, file, customRoot)
   if (!found)
     return null
-  const buf = fs.readFileSync(found.path)
-  log(`[usm] 使用本地游戏文件${found.how} (${found.kind}): ${found.path} (${buf.length} 字节)`)
-  return new Uint8Array(buf)
+  let stat
+  try {
+    stat = await fs.promises.stat(found.path)
+  }
+  catch {
+    return null
+  }
+  const key = localUsmCacheKey(found.path, stat)
+  let bytes = localUsmCacheGet(key)
+  if (bytes) {
+    log(`[usm] 使用本地游戏文件${found.how} (${found.kind}, 缓存命中): ${found.path} (${bytes.length} 字节)`)
+    return bytes
+  }
+  let buf
+  try {
+    buf = await fs.promises.readFile(found.path)
+  }
+  catch (err) {
+    log(`[usm] 本地文件读取失败: ${found.path}: ${err.message}`)
+    return null
+  }
+  bytes = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
+  localUsmCachePut(key, bytes)
+  log(`[usm] 使用本地游戏文件${found.how} (${found.kind}): ${found.path} (${bytes.length} 字节)`)
+  return bytes
 }
 
 /**
  * 只读本地 USM 的前 maxBytes 字节, 供"探测视频格式"用。
  *
  * detectUsmBytes 只需要第一个视频块的 magic (4 字节) 和 VIDEO_HDRINFO 里的
- * AES-CTR nonce, 两者都在文件头部; 而完整文件动辄 300MB+, fetchLocalUsm 会
- * readFileSync 全量 + new Uint8Array 再拷一份 —— 为了 4 个字节付出 600MB 级
- * 的分配和磁盘读, 这是点播放后第一段干等的来源。
- *
- * 头部不足时 detectUsmBytes 会返回 null, 调用方需回退到 fetchLocalUsm 完整
- * 读取, 因此这里不做任何判定逻辑, 只是少读。
+ * AES-CTR nonce, 两者都在文件头部; 而完整文件动辄 300MB+。头部不足时
+ * detectUsmBytes 会返回 null, 调用方需回退到 fetchLocalUsm 完整读取,
+ * 因此这里不做任何判定逻辑, 只是少读。
  */
-function fetchLocalUsmHead(game, file, log = () => {}, customRoot = null, maxBytes = 8 << 20) {
-  const found = locateLocalUsm(game, file, customRoot)
+async function fetchLocalUsmHead(game, file, log = () => {}, customRoot = null, maxBytes = 8 << 20) {
+  const found = await locateLocalUsm(game, file, customRoot)
   if (!found)
     return null
-  const size = fs.statSync(found.path).size
-  const len = Math.min(maxBytes, size)
+  let stat
+  try {
+    stat = await fs.promises.stat(found.path)
+  }
+  catch {
+    return null
+  }
+  const len = Math.min(maxBytes, stat.size)
   if (len <= 0)
     return new Uint8Array(0)
+
+  // 完整文件已在缓存里（例如刚被 usm-webm 转换过）: 直接切片, 不再碰盘
+  const cached = localUsmCacheGet(localUsmCacheKey(found.path, stat))
+  if (cached)
+    return cached.subarray(0, len)
+
   const buf = Buffer.allocUnsafe(len)
-  const fd = fs.openSync(found.path, 'r')
+  const fd = await fs.promises.open(found.path, 'r')
   try {
-    fs.readSync(fd, buf, 0, len, 0)
+    await fd.read(buf, 0, len, 0)
   }
   finally {
-    fs.closeSync(fd)
+    await fd.close()
   }
-  log(`[usm] 探测: 读取头部 ${len} 字节 (文件共 ${size} 字节) ${found.path}`)
+  log(`[usm] 探测: 读取头部 ${len} 字节 (文件共 ${stat.size} 字节) ${found.path}`)
   return new Uint8Array(buf.buffer, buf.byteOffset, len)
 }
 
@@ -272,6 +363,9 @@ const MIME = {
   '.jpg': 'image/jpeg',
   '.webp': 'image/webp',
 }
+
+/** JSON gzip 结果缓存: filePath -> { mtimeMs, size, gz } (文件 mtime 变化自动失效) */
+const gzipCache = new Map()
 
 /**
  * 宽松解码 URL 路径段。
@@ -338,21 +432,23 @@ async function handleRequest(req, res) {
     const files = Array.isArray(body.files) ? body.files : []
     try {
       const found = {}
-      for (const f of files) {
-        if (typeof f !== 'string' || !f)
-          continue
+      const results = await mapPool(files.filter(f => typeof f === 'string' && f), 16, async (f) => {
         const request = resolveUsmBackendRequest(game, f, '')
-        let hit = locateLocalUsm(game, request.file, gameDir)
+        let hit = await locateLocalUsm(game, request.file, gameDir)
         if (!hit && request.aliased)
-          hit = locateLocalUsm(game, f, gameDir)
+          hit = await locateLocalUsm(game, f, gameDir)
         if (!hit)
-          continue
+          return null
         let size = null
         try {
-          size = fs.statSync(hit.path).size
+          size = (await fs.promises.stat(hit.path)).size
         }
         catch { /* 忽略 */ }
-        found[f] = { path: hit.path, source: hit.kind, how: hit.how, size }
+        return [f, { path: hit.path, source: hit.kind, how: hit.how, size }]
+      })
+      for (const r of results) {
+        if (r)
+          found[r[0]] = r[1]
       }
       tlog(`[usm-local] ${game}: 命中本地 ${Object.keys(found).length}/${files.length}`)
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
@@ -375,13 +471,13 @@ async function handleRequest(req, res) {
     const gameDir = url.searchParams.get('game_dir') ?? null
     try {
       let format = null
-      const localUsmHead = fetchLocalUsmHead(game, file, msg => tlog(msg), gameDir)
+      const localUsmHead = await fetchLocalUsmHead(game, file, msg => tlog(msg), gameDir)
       if (localUsmHead) {
         format = await detectUsmBytes(localUsmHead, { game, file, dataDir: DATA_ROOT, log: msg => tlog(msg) })
         if (!format) {
           // 头部不足以判定 (第一个视频块比 maxBytes 更靠后): 回退完整读取,
           // 行为与改动前完全一致。
-          const localUsm = fetchLocalUsm(game, file, msg => tlog(msg), gameDir)
+          const localUsm = await fetchLocalUsm(game, file, msg => tlog(msg), gameDir)
           if (localUsm)
             format = await detectUsmBytes(localUsm, { game, file, dataDir: DATA_ROOT, log: msg => tlog(msg) })
         }
@@ -421,18 +517,14 @@ async function handleRequest(req, res) {
     let target = request.aliased ? '' : url.searchParams.get('url') ?? ''
     // 支持按 游戏+文件+版本 拼直链 (兼容旧调用)
     if (!target && version) {
-      try {
-        const versions = JSON.parse(fs.readFileSync(path.join(DATA_ROOT, `${game}_versions.json`), 'utf-8'))
-        const vd = versions[version]
-        const base = vd?.decompressed_path
-        if (base)
-          target = `${base.replace(/\/+$/, '')}/${file}`
-      }
-      catch { /* 保持空 */ }
+      const versions = readJsonCached(path.join(DATA_ROOT, `${game}_versions.json`))
+      const base = versions?.[version]?.decompressed_path
+      if (base)
+        target = `${base.replace(/\/+$/, '')}/${file}`
     }
     try {
       let mp4 = null
-      const localUsm = fetchLocalUsm(game, file, msg => tlog(msg), gameDir)
+      const localUsm = await fetchLocalUsm(game, file, msg => tlog(msg), gameDir)
       if (localUsm) {
         mp4 = await usmBytesToMp4(localUsm, { game, file, dataDir: DATA_ROOT, log: msg => tlog(msg) })
       }
@@ -454,7 +546,7 @@ async function handleRequest(req, res) {
         'Cache-Control': 'no-cache',
         'Accept-Ranges': 'bytes',
       })
-      res.end(Buffer.from(mp4), () => tlog('[api] usm-mp4 响应已发送', ((Date.now()-t0)/1000).toFixed(2)+'s'))
+      res.end(mp4, () => tlog('[api] usm-mp4 响应已发送', ((Date.now()-t0)/1000).toFixed(2)+'s'))
     }
     catch (err) {
       res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' })
@@ -475,17 +567,16 @@ async function handleRequest(req, res) {
     const gameDir = url.searchParams.get('game_dir') ?? null
     let target = request.aliased ? '' : url.searchParams.get('url') ?? ''
     if (!target && version) {
-      try {
-        const versions = JSON.parse(fs.readFileSync(path.join(DATA_ROOT, `${game}_versions.json`), 'utf-8'))
-        const base = versions[version]?.decompressed_path
-        if (base)
-          target = `${base.replace(/\/+$/, '')}/${file}`
-      }
-      catch { /* 保持空 */ }
+      const versions = readJsonCached(path.join(DATA_ROOT, `${game}_versions.json`))
+      const base = versions?.[version]?.decompressed_path
+      if (base)
+        target = `${base.replace(/\/+$/, '')}/${file}`
     }
     try {
+      // usmBytesToMkv 返回分段数组 (EBML 头/Segment/各 Cluster), 拼接动作交给
+      // res.write 逐段发出, 省掉两份全量拷贝。
       let mkv = null
-      const localUsm = fetchLocalUsm(game, file, msg => tlog(msg), gameDir)
+      const localUsm = await fetchLocalUsm(game, file, msg => tlog(msg), gameDir)
       if (localUsm) {
         mkv = await usmBytesToMkv(localUsm, { game, file, dataDir: DATA_ROOT, chIndex, log: msg => tlog(msg) })
       }
@@ -510,13 +601,16 @@ async function handleRequest(req, res) {
         const usm = await assembleUsmFromChunks(game, file, { version, dataDir: DATA_ROOT, log: msg => tlog(msg) })
         mkv = await usmBytesToMkv(usm, { game, file, dataDir: DATA_ROOT, chIndex, log: msg => tlog(msg) })
       }
+      const total = mkv.reduce((s, p) => s + p.length, 0)
       res.writeHead(200, {
         'Content-Type': 'video/x-matroska',
-        'Content-Length': mkv.length,
+        'Content-Length': total,
         'Cache-Control': 'no-cache',
         'Accept-Ranges': 'bytes',
       })
-      res.end(Buffer.from(mkv), () => tlog('[api] usm-mkv 响应已发送', ((Date.now()-t0)/1000).toFixed(2)+'s'))
+      for (const part of mkv)
+        res.write(part)
+      res.end(() => tlog('[api] usm-mkv 响应已发送', ((Date.now()-t0)/1000).toFixed(2)+'s'))
     }
     catch (err) {
       res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' })
@@ -537,17 +631,14 @@ async function handleRequest(req, res) {
     const gameDir = url.searchParams.get('game_dir') ?? null
     let target = request.aliased ? '' : url.searchParams.get('url') ?? ''
     if (!target && version) {
-      try {
-        const versions = JSON.parse(fs.readFileSync(path.join(DATA_ROOT, `${game}_versions.json`), 'utf-8'))
-        const base = versions[version]?.decompressed_path
-        if (base)
-          target = `${base.replace(/\/+$/, '')}/${file}`
-      }
-      catch {}
+      const versions = readJsonCached(path.join(DATA_ROOT, `${game}_versions.json`))
+      const base = versions?.[version]?.decompressed_path
+      if (base)
+        target = `${base.replace(/\/+$/, '')}/${file}`
     }
     try {
       let webm = null
-      const localUsm = fetchLocalUsm(game, file, msg => tlog(msg), gameDir)
+      const localUsm = await fetchLocalUsm(game, file, msg => tlog(msg), gameDir)
       if (localUsm)
         webm = await usmBytesToWebm(localUsm, { game, file, dataDir: DATA_ROOT, chIndex, includeAudio, log: msg => tlog(msg) })
       if (!webm && target) {
@@ -573,7 +664,7 @@ async function handleRequest(req, res) {
         'Cache-Control': 'no-cache',
         'Accept-Ranges': 'bytes',
       })
-      res.end(Buffer.from(webm), () => tlog('[api] usm-webm 响应已发送', ((Date.now() - t0) / 1000).toFixed(2) + 's'))
+      res.end(webm, () => tlog('[api] usm-webm 响应已发送', ((Date.now() - t0) / 1000).toFixed(2) + 's'))
     }
     catch (err) {
       res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' })
@@ -593,14 +684,14 @@ async function handleRequest(req, res) {
     const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36'
     try {
       // 本地游戏文件优先（Persistent 副本的 nonce/audioKey 与 CDN 基线不同）
-      const localUsm = fetchLocalUsm(game, file, msg => tlog(msg), gameDir)
+      const localUsm = await fetchLocalUsm(game, file, msg => tlog(msg), gameDir)
       if (localUsm) {
         res.writeHead(200, {
           'Content-Type': 'application/octet-stream',
           'Content-Length': localUsm.length,
           'Cache-Control': 'no-cache',
         })
-        res.end(Buffer.from(localUsm))
+        res.end(localUsm)
         return
       }
       if (target) {
@@ -615,14 +706,8 @@ async function handleRequest(req, res) {
             ...(len ? { 'Content-Length': len } : {}),
             'Cache-Control': 'no-cache',
           })
-          const reader = upstream.body.getReader()
-          for (;;) {
-            const { done, value } = await reader.read()
-            if (done)
-              break
-            res.write(Buffer.from(value))
-          }
-          res.end()
+          // pipe 自带背压处理; 手写 read 循环会无视 res.write 的缓冲水位
+          Readable.fromWeb(upstream.body).pipe(res)
           return
         }
         console.log(`[usm-proxy] 直链失败 HTTP ${upstream.status}, 回退 chunk`)
@@ -879,6 +964,14 @@ async function handleRequest(req, res) {
     const ext = path.extname(filePath)
     console.log(`[req] ${req.method} ${url.pathname} (${stat.size} bytes, ae=${req.headers['accept-encoding'] ?? '-'})`)
 
+    // ETag (mtime+size): 前端重复拉取同一份大清单时回 304, 不再全量重传
+    const etag = `"${stat.size.toString(36)}-${Math.round(stat.mtimeMs).toString(36)}"`
+    if (req.headers['if-none-match'] === etag) {
+      res.writeHead(304, { ETag: etag })
+      res.end()
+      return
+    }
+
     // Range 请求 (探测/断点): 返回 206 部分内容, 不走 gzip
     const range = req.headers.range
     if (range) {
@@ -905,21 +998,56 @@ async function handleRequest(req, res) {
       return
     }
     res.on('finish', () => console.log(`[res] ${url.pathname} sent ${res.writableLength === 0 ? 'done' : '?'}`))
-    // JSON 响应启用 gzip (浏览器 fetch 自动解压, 大清单体积可减 7 倍)
+    // JSON 响应启用 gzip (浏览器 fetch 自动解压, 大清单体积可减 7 倍)。
+    // 压缩按 mtime 缓存且异步执行: 原来每个请求都 gzipSync 同步压缩几 MB 的
+    // 清单, 压缩期间整个事件循环(含正在推流的视频)都被卡住。
     if (ext === '.json' && (req.headers['accept-encoding'] ?? '').includes('gzip')) {
-      const gz = zlib.gzipSync(fs.readFileSync(filePath))
-      res.writeHead(200, {
-        'Content-Type': MIME[ext],
-        'Content-Length': gz.length,
-        'Content-Encoding': 'gzip',
-        'Cache-Control': 'no-cache',
+      const gzHit = gzipCache.get(filePath)
+      if (gzHit && gzHit.mtimeMs === stat.mtimeMs && gzHit.size === stat.size) {
+        res.writeHead(200, {
+          'Content-Type': MIME[ext],
+          'Content-Length': gzHit.gz.length,
+          'Content-Encoding': 'gzip',
+          'ETag': etag,
+          'Cache-Control': 'no-cache',
+        })
+        res.end(gzHit.gz)
+        return
+      }
+      fs.readFile(filePath, (readErr, raw) => {
+        if (readErr) {
+          res.writeHead(500)
+          res.end('Read Error')
+          return
+        }
+        zlib.gzip(raw, (gzErr, gz) => {
+          if (gzErr || res.destroyed) {
+            if (!res.headersSent) {
+              res.writeHead(500)
+              res.end('Gzip Error')
+            }
+            return
+          }
+          gzipCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, gz })
+          if (gzipCache.size > 32) {
+            gzipCache.delete(gzipCache.keys().next().value)
+          }
+          res.writeHead(200, {
+            'Content-Type': MIME[ext],
+            'Content-Length': gz.length,
+            'Content-Encoding': 'gzip',
+            'ETag': etag,
+            'Cache-Control': 'no-cache',
+          })
+          res.end(gz)
+        })
       })
-      res.end(gz)
       return
     }
     res.writeHead(200, {
       'Content-Type': MIME[ext] || 'application/octet-stream',
       'Content-Length': stat.size,
+      'ETag': etag,
       'Cache-Control': 'no-cache',
     })
     fs.createReadStream(filePath).pipe(res)

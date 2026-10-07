@@ -15,6 +15,12 @@ interface ManifestRecord {
 
 let dbPromise: ReturnType<typeof openDB<{ manifests: { key: string, value: ManifestRecord } }>> | null = null
 
+// 缓存总字节数的会话内记忆: evictIfNeeded 原来每次写入都 getAll 把全部缓存
+// (上限 500MB 的对象) 反序列化一遍只为算总量。首次写入时全量建一次基线,
+// 之后增量维护; 页面刷新重新建基线。多标签页各自计数可能漂移, 但只影响
+// 一次驱逐时机, 不影响数据正确性。
+let totalSizeMemo: number | null = null
+
 function getDB() {
   if (!dbPromise) {
     dbPromise = openDB<{ manifests: { key: string, value: ManifestRecord } }>(DB_NAME, DB_VERSION, {
@@ -42,26 +48,27 @@ export async function getManifest(key: string): Promise<ParsedManifest | null> {
 export async function setManifest(key: string, data: ParsedManifest, size: number): Promise<void> {
   try {
     const db = await getDB()
-    await evictIfNeeded(db, size)
+    if (totalSizeMemo === null) {
+      const all = await db.getAll(STORE_NAME)
+      totalSizeMemo = all.reduce((s, r) => s + r.size, 0)
+    }
+    if (totalSizeMemo + size > MAX_SIZE) {
+      const all = await db.getAll(STORE_NAME)
+      all.sort((a, b) => a.timestamp - b.timestamp)
+      let total = totalSizeMemo
+      for (const record of all) {
+        if (total + size <= MAX_SIZE)
+          break
+        await db.delete(STORE_NAME, record.key)
+        total -= record.size
+      }
+      totalSizeMemo = total
+    }
     const record: ManifestRecord = { key, data, size, timestamp: Date.now() }
     await db.put(STORE_NAME, record)
+    totalSizeMemo += size
   }
   catch { }
-}
-
-async function evictIfNeeded(db: Awaited<ReturnType<typeof getDB>>, incoming: number) {
-  const all = await db.getAll(STORE_NAME)
-  let total = all.reduce((s, r) => s + r.size, 0)
-  if (total + incoming <= MAX_SIZE)
-    return
-
-  all.sort((a, b) => a.timestamp - b.timestamp)
-  for (const record of all) {
-    if (total + incoming <= MAX_SIZE)
-      break
-    await db.delete(STORE_NAME, record.key)
-    total -= record.size
-  }
 }
 
 export interface CacheStats {
@@ -92,4 +99,5 @@ export async function getCacheStats(): Promise<CacheStats | CacheUnavailable> {
 export async function clearCache(): Promise<void> {
   const db = await getDB()
   await db.clear(STORE_NAME)
+  totalSizeMemo = 0
 }

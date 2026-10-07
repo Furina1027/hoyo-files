@@ -69,7 +69,9 @@ export async function fetchAndParseManifest(
   const buffer = await res.arrayBuffer()
   const parsed = await parseManifestBinary(new Uint8Array(buffer), uncompressedSize)
 
-  const size = JSON.stringify(parsed).length * 2
+  // 大小用未压缩字节数估算即可。原来 JSON.stringify 整个 parsed 只为估个大小,
+  // 几十 MB 的清单 stringify 一次要几百 ms, 而这里每次缓存新 manifest 都会发生。
+  const size = Math.max(uncompressedSize, 1024)
   await setManifest(cacheKey, parsed, size)
 
   return parsed

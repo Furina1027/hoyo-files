@@ -840,10 +840,22 @@ async function applyHdiff(oldPath, patchPath, outPath, hpatchz) {
   })
 }
 
-function sliceEntry(entry) {
-  const url = joinUrl(entry.url_prefix, entry.bundle_id, entry.url_suffix)
-  return fetchBytes(url, { expectedSize: entry.bundle_size || undefined, expectedMd5: entry.bundle_md5 || undefined })
-    .then(buf => buf.subarray(entry.bundle_offset, entry.bundle_offset + entry.bundle_length))
+/**
+ * 带磁盘缓存的 diff 切片提取: 同一个 diff bundle 通常装着多个文件的切片,
+ * 逐文件各下一次整包是批量重建时最大的流量浪费。bundle 按 id 落盘
+ * (bundleCache 目录随整批任务结束删除), 同批内同 id 只下一次。
+ */
+async function sliceEntryCached(entry, bundleCacheDir, bundleFileMap) {
+  let cachedPath = bundleFileMap.get(entry.bundle_id)
+  if (!cachedPath || !fs.existsSync(cachedPath)) {
+    const url = joinUrl(entry.url_prefix, entry.bundle_id, entry.url_suffix)
+    const buf = await fetchBytes(url, { expectedSize: entry.bundle_size || undefined, expectedMd5: entry.bundle_md5 || undefined })
+    cachedPath = path.join(bundleCacheDir, `bundle_${String(entry.bundle_id).replace(/[^a-zA-Z0-9_-]/g, '_')}.bin`)
+    fs.writeFileSync(cachedPath, buf)
+    bundleFileMap.set(entry.bundle_id, cachedPath)
+  }
+  const buf = fs.readFileSync(cachedPath)
+  return buf.subarray(entry.bundle_offset, entry.bundle_offset + entry.bundle_length)
 }
 
 /**
@@ -888,6 +900,8 @@ export async function downloadPredownloadFiles(gameId, dataDir, { files = null, 
   const root = path.resolve(outRoot ?? path.join(dataDir, '..', 'downloads'), gameId)
   const bundleCache = path.join(root, '.bundle_cache')
   fs.mkdirSync(bundleCache, { recursive: true })
+  // bundle_id -> 本地缓存路径 (本批任务内复用, 目录最终整体删除)
+  const bundleFileMap = new Map()
 
   // chunk 直下信息 (目标版本可用时优先; 不可用则为 null)
   let chunkIndex = null
@@ -935,9 +949,9 @@ export async function downloadPredownloadFiles(gameId, dataDir, { files = null, 
             url_suffix: '',
             chunks: chunkEntry.chunks,
           }
-          const size = await downloadChunkFile(info, outPath, log)
-          ok.push({ file: entry.file, size, mode: 'chunk' })
-          log(`  ✓ chunk 直下 ${size} 字节`)
+          const buf = await downloadChunkFile(info, outPath, log)
+          ok.push({ file: entry.file, size: buf.length, mode: 'chunk' })
+          log(`  ✓ chunk 直下 ${buf.length} 字节`)
           continue
         }
         catch (err) {
@@ -947,7 +961,7 @@ export async function downloadPredownloadFiles(gameId, dataDir, { files = null, 
 
       // 仅当 chunk 直下不可用/失败时才取 diff 切片
       // (切片需整包下载, 大包在 60s 超时内下不完, 放在最后可避免拖死可直下的文件)
-      const slice = await sliceEntry(entry)
+      const slice = await sliceEntryCached(entry, bundleCache, bundleFileMap)
       tmp = path.join(bundleCache, `slice_${processed}_${Date.now()}.bin`)
 
       if (entry.kind === 'added') {
@@ -1170,9 +1184,9 @@ export async function ensureChunkIndex(gameId, dataDir, version, log = () => {})
 /** 从 getBuild 快照取 chunk 下载前缀 */
 function chunkUrlPrefixOf(gameId, dataDir, version) {
   const snapshotPath = path.join(dataDir, 'chunk', `${gameId}_${version}.json`)
-  if (!fs.existsSync(snapshotPath))
+  const buildInfo = readJsonCached(snapshotPath)
+  if (!buildInfo)
     return ''
-  const buildInfo = JSON.parse(fs.readFileSync(snapshotPath, 'utf-8'))
   const ref = (buildInfo.data?.manifests ?? []).find(m => (m.chunk_download?.url_prefix ?? '').length > 0)
   return ref?.chunk_download?.url_prefix ?? ''
 }
@@ -1198,8 +1212,9 @@ export async function predownloadChunkInfo(gameId, dataDir, file, log = () => {}
   }
 }
 
-/** 按 chunk 索引下载单个文件 (校验每块大小/MD5, 输出 MD5) */
-async function downloadChunkFile(chunkInfo, outPath, log) {
+/** 按 chunk 索引下载单个文件 (校验每块大小/MD5, 输出 MD5)。
+ *  skipWrite 时不在落盘, 直接返回内存中的 Buffer (组装 USM 传给转换时省一次写+读)。 */
+async function downloadChunkFile(chunkInfo, outPath, log, { skipWrite = false } = {}) {
   const parts = []
   await mapPool(chunkInfo.chunks, 8, async (c) => {
     const url = joinUrl(chunkInfo.url_prefix, c.id, chunkInfo.url_suffix)
@@ -1227,8 +1242,9 @@ async function downloadChunkFile(chunkInfo, outPath, log) {
   }
   if (chunkInfo.md5 && md5(buf) !== chunkInfo.md5)
     throw new Error(`文件 MD5 不匹配: ${md5(buf)} != ${chunkInfo.md5}`)
-  fs.writeFileSync(outPath, buf)
-  return buf.length
+  if (!skipWrite)
+    fs.writeFileSync(outPath, buf)
+  return buf
 }
 
 // ---------- USM 探测与 MP4 转换 (浏览器 <video> 直接加载, 避开 fetch 大响应限制) ----------
@@ -1353,13 +1369,15 @@ function decryptChunkAesCtr(data, aesKeyBytes, nonceBytes, frameTime) {
 
 /**
  * 提取并解密视频流 (mask / aes / 明文三模式共用)。
- * 返回 { format: 'h264'|'mpeg1'|'vp9'|null, stream }。
+ * 返回 { format, stream, chunks, key } — chunks 是整份 USM 的解析结果,
+ * 调用方提取音频时直接复用, 不再重复 parseUsmChunks (300MB 级文件全量遍历)。
  */
 async function prepareVideoStream(usm, { game = '', file = '', dataDir = null, log = () => {} } = {}) {
   const { parseUsmChunks, makeVideoMask, decryptVideo, findVideoNonce } = await importUsmDemux()
 
   log(`[usm] ${usm.length} 字节, 解析容器...`)
-  const videoChunks = parseUsmChunks(usm).filter(c => c.type === '@SFV' || c.type === 'EVID')
+  const chunks = parseUsmChunks(usm)
+  const videoChunks = chunks.filter(c => c.type === '@SFV' || c.type === 'EVID')
   const key = resolveKeyEntry(findUsmKey(dataDir, game, file))
 
   let parts
@@ -1424,7 +1442,7 @@ async function prepareVideoStream(usm, { game = '', file = '', dataDir = null, l
       throw new Error('解密后不是可识别的视频流 (key 可能不正确)')
     throw new Error('视频已加密且未找到对应 key (需抓包获取)')
   }
-  return { format, stream: video }
+  return { format, stream: video, chunks, key }
 }
 
 /** MPEG1 裸流 → MP4 (H.264): 借本机 ffmpeg 转码 (4.5 TV 类小视频为明文 MPEG1)。
@@ -1531,6 +1549,9 @@ async function findFfmpeg() {
   return null
 }
 
+/** 平台是否小端 (现实中所有 Node 平台均如此); 非小端走逐样本回退, 保证字节序正确 */
+const IS_LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1
+
 function pcmToWav(pcm, sampleRate, channels) {
   const dataSize = pcm.length * 2
   const output = Buffer.alloc(44 + dataSize)
@@ -1547,8 +1568,14 @@ function pcmToWav(pcm, sampleRate, channels) {
   output.writeUInt16LE(16, 34)
   output.write('data', 36)
   output.writeUInt32LE(dataSize, 40)
-  for (let i = 0; i < pcm.length; i++)
-    output.writeInt16LE(pcm[i], 44 + i * 2)
+  if (IS_LITTLE_ENDIAN) {
+    // Int16Array 的内存表示即 LE PCM, 按字节整块拷贝
+    output.set(Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength), 44)
+  }
+  else {
+    for (let i = 0; i < pcm.length; i++)
+      output.writeInt16LE(pcm[i], 44 + i * 2)
+  }
   return new Uint8Array(output)
 }
 
@@ -1558,9 +1585,8 @@ function reunionHcaAudioKey(file, key) {
   return base === 'video_reunion_67.usm' && key.mode === 'mask' ? key.keyHex : ''
 }
 
-async function decodeAudioWav(usm, { game = '', file = '', dataDir = null, chIndex = 0, log = () => {} } = {}) {
-  const { parseUsmChunks, makeAudioMask, decryptAudio } = await importUsmDemux()
-  const chunks = parseUsmChunks(usm)
+async function decodeAudioWav(chunks, { game = '', file = '', dataDir = null, chIndex = 0, log = () => {} } = {}) {
+  const { makeAudioMask, decryptAudio } = await importUsmDemux()
   const audioChunks = chunks.filter(c => c.type === '@SFA' && c.chno === chIndex)
   if (!audioChunks.length) {
     log(`[usm] 未找到 chno=${chIndex} 音频`)
@@ -1583,12 +1609,16 @@ async function decodeAudioWav(usm, { game = '', file = '', dataDir = null, chInd
   return pcmToWav(audio.pcm, audio.sampleRate, audio.channels)
 }
 
-async function decodeAudioWavs(usm, { game = '', file = '', dataDir = null, chIndex = null, log = () => {} } = {}) {
+/** 输入 prepareVideoStream 返回的 chunks (整份 USM 只解析一次)。 */
+async function decodeAudioWavs(chunks, { game = '', file = '', dataDir = null, chIndex = null, log = () => {} } = {}) {
+  // 绝区零等 USM 内无 @SFA 块: 先短路, 避免对每个候选通道各做一次全量过滤
+  if (!chunks.some(c => c.type === '@SFA'))
+    throw new Error(chIndex == null ? '未找到可用 @SFA 音频' : `未找到 chno=${chIndex} 音频`)
   const channels = chIndex == null ? [0, 1, 2, 3] : [chIndex]
   const tracks = []
   for (const channel of channels) {
     try {
-      const wav = await decodeAudioWav(usm, { game, file, dataDir, chIndex: channel, log })
+      const wav = await decodeAudioWav(chunks, { game, file, dataDir, chIndex: channel, log })
       if (wav)
         tracks.push({ channel, wav })
     }
@@ -1660,7 +1690,7 @@ async function muxVp9WithFfmpeg(ivf, audio, container, { log = () => {} } = {}) 
 }
 
 export async function usmBytesToWebm(usm, { game = '', file = '', dataDir = null, chIndex = null, includeAudio = true, log = () => {} } = {}) {
-  const { format, stream } = await prepareVideoStream(usm, { game, file, dataDir, log })
+  const { format, stream, chunks } = await prepareVideoStream(usm, { game, file, dataDir, log })
   const keyMode = resolveKeyEntry(findUsmKey(dataDir, game, file)).mode
   // 67_test 的历史回退源是旧 mask VP9；与 7.1 AES VP9 共用同一条服务器解密播放路径。
   // 崩铁 2.3 之前的 LOOP 系列是**未加密** VP9/IVF（key 库全 0 约定值），此前被这条
@@ -1671,7 +1701,7 @@ export async function usmBytesToWebm(usm, { game = '', file = '', dataDir = null
   // 直接交给 ffmpeg -c:v copy 封装即可（无音轨的 LOOP 文件会自动只映射视频轨）。
   if (format !== 'vp9' || (keyMode !== 'aes' && keyMode !== 'mask' && keyMode !== 'plain'))
     throw new Error('WebM 导出仅支持 VP9 视频')
-  const audio = includeAudio ? await decodeAudioWavs(usm, { game, file, dataDir, chIndex, log }) : []
+  const audio = includeAudio ? await decodeAudioWavs(chunks, { game, file, dataDir, chIndex, log }) : []
   return await muxVp9WithFfmpeg(stream, audio, 'webm', { log })
 }
 
@@ -1685,19 +1715,18 @@ export async function usmBytesToWebm(usm, { game = '', file = '', dataDir = null
  * @param chIndex 音频通道下标 (0=第一语言...), 默认 0
  */
 export async function usmBytesToMkv(usm, { game = '', file = '', dataDir = null, chIndex = null, log = () => {} } = {}) {
-  const { parseUsmChunks, makeAudioMask, decryptAudio } = await importUsmDemux()
   const h264Mod = await import(pathToFileURL(path.join(__dirname, '../src/utils/h264mux.ts')).href)
   const { splitAnnexBToFrames, parseSps, makeAvcC } = h264Mod
   const { muxMkv } = await import(pathToFileURL(path.join(__dirname, '../src/utils/mkvmux.ts')).href)
 
   // ---- 视频 ----
-  const { format, stream: video } = await prepareVideoStream(usm, { game, file, dataDir, log })
+  const { format, stream: video, chunks, key } = await prepareVideoStream(usm, { game, file, dataDir, log })
   if (format === 'vp9') {
-    const keyMode = resolveKeyEntry(findUsmKey(dataDir, game, file)).mode
     // 同 usmBytesToWebm: 明文 VP9(崩铁 2.3 前的 LOOP 系列) 也走 ffmpeg 封装
-    if (keyMode === 'aes' || keyMode === 'mask' || keyMode === 'plain') {
-      const audio = await decodeAudioWavs(usm, { game, file, dataDir, chIndex, log })
-      return await muxVp9WithFfmpeg(video, audio, 'mkv', { log })
+    if (key.mode === 'aes' || key.mode === 'mask' || key.mode === 'plain') {
+      const audio = await decodeAudioWavs(chunks, { game, file, dataDir, chIndex, log })
+      // 与 H.264 分支一致, 统一返回分段数组 (ffmpeg 输出为单段)
+      return [await muxVp9WithFfmpeg(video, audio, 'mkv', { log })]
     }
     throw new Error('VP9 视频请使用流式播放')
   }
@@ -1725,25 +1754,7 @@ export async function usmBytesToMkv(usm, { game = '', file = '', dataDir = null,
   const spsInfo = parseSps(sps)
   const fps = spsInfo.fps >= 1 && spsInfo.fps <= 120 ? spsInfo.fps : 30
 
-  // 每帧转成带 start code 的 Annex-B (mkvmux 内部转 AVCC)
-  const videoFrames = frames.map(group => {
-    let size = 0
-    for (const nal of group)
-      size += 3 + nal.length
-    const buf = new Uint8Array(size)
-    let off = 0
-    for (const nal of group) {
-      buf[off++] = 0
-      buf[off++] = 0
-      buf[off++] = 1
-      buf.set(nal, off)
-      off += nal.length
-    }
-    return buf
-  })
-
   // ---- 音频: @SFA 按 chno 汇总, ADX / HCA 双格式 ----
-  const chunks = parseUsmChunks(usm)
   const audioChannel = chIndex ?? 0
   const audioChunks = chunks.filter(c => c.type === '@SFA' && c.chno === audioChannel)
   if (!audioChunks.length)
@@ -1754,7 +1765,6 @@ export async function usmBytesToMkv(usm, { game = '', file = '', dataDir = null,
   let audio
   if (isHca) {
     // 4.5 method2: HCA (type56 子帧加密, keycode=audioKey) → wasm 解码出 WAV → PCM
-    const key = resolveKeyEntry(findUsmKey(dataDir, game, file))
     if (!key.audioHex)
       throw new Error(`method2 文件缺少音频 audioKey (keys.json 条目需含 audio 字段)`)
     const hca = concatBytes(audioChunks.map(c => c.data))
@@ -1764,7 +1774,7 @@ export async function usmBytesToMkv(usm, { game = '', file = '', dataDir = null,
   }
   else {
     // ADX: 4.4 加密文件用视频 key 派生的音频掩码; 4.5 明文文件 (对象 key/全零) 不解密
-    const key = resolveKeyEntry(findUsmKey(dataDir, game, file))
+    const { makeAudioMask, decryptAudio } = await importUsmDemux()
     const { decodeAdx } = await import(pathToFileURL(path.join(__dirname, '../src/utils/adx_decoder.ts')).href)
     const audioMask = key.mode === 'mask' ? makeAudioMask(BigInt(`0x${key.keyHex}`)) : null
     const audioParts = audioChunks.map(c => audioMask ? decryptAudio(c.data, audioMask) : c.data)
@@ -1775,9 +1785,11 @@ export async function usmBytesToMkv(usm, { game = '', file = '', dataDir = null,
 
   // ---- MKV 封装 ----
   log(`[usm] 封装 MKV...`)
-  const mkv = muxMkv(
+  // frames 直接以 NAL 组交给 muxer (framesNals), 省掉「重拼 start code →
+  // muxer 里再扫掉」的两遍全帧处理; muxMkv 返回分段数组, 由响应层逐段写出。
+  const mkvParts = muxMkv(
     {
-      frames: videoFrames,
+      framesNals: frames,
       width: spsInfo.width,
       height: spsInfo.height,
       fps,
@@ -1790,15 +1802,26 @@ export async function usmBytesToMkv(usm, { game = '', file = '', dataDir = null,
       channels: audio.channels,
     },
   )
-  log(`[usm] MKV ${mkv.length} 字节`)
-  return mkv
+  const total = mkvParts.reduce((s, p) => s + p.length, 0)
+  log(`[usm] MKV ${total} 字节`)
+  return mkvParts
 }
 
-/** 在 Node 里跑前端 wasm 的 decode_hca: 输入 [HCA 流], 输出 WAV 字节 */
-async function decodeHcaWavInNode(hcaBytes, audioKeyHex, log = () => {}) {
+/** 在 Node 里跑前端 wasm 的 decode_hca: 输入 [HCA 流], 输出 WAV 字节。
+ *  wasm 实例模块级缓存: 原来每次解码都重新读 wasm 文件 + initSync。 */
+let _hcaGlue = null
+async function loadHcaGlue() {
+  if (_hcaGlue)
+    return _hcaGlue
   const dir = path.join(__dirname, '../src/assets/usm/')
   const glue = await import(pathToFileURL(path.join(dir, 'usm_decoder.js')).href)
   glue.initSync({ module: new Uint8Array(fs.readFileSync(path.join(dir, 'usm_decoder_bg.wasm'))) })
+  _hcaGlue = glue
+  return glue
+}
+
+async function decodeHcaWavInNode(hcaBytes, audioKeyHex, log = () => {}) {
+  const glue = await loadHcaGlue()
   const wav = glue.decode_hca([hcaBytes], audioKeyHex)
   if (!wav || !wav.length || wav[0] !== 0x52 || wav[1] !== 0x49)
     throw new Error('HCA 解码失败 (audioKey 可能不正确)')
@@ -1825,6 +1848,12 @@ function parseWavPcm(wav) {
   if (!fmt || dataOff < 0 || fmt.bits !== 16)
     throw new Error('WAV 格式不支持 (需 16bit PCM)')
   const samples = Math.floor(dataLen / 2 / fmt.channels)
+  const byteOffset = wav.byteOffset + dataOff
+  if (IS_LITTLE_ENDIAN && byteOffset % 2 === 0) {
+    // data chunk 对齐且平台小端: PCM 视图直接引用, 免掉逐样本读取
+    const pcm = new Int16Array(wav.buffer, byteOffset, samples * fmt.channels)
+    return { pcm, sampleRate: fmt.sampleRate, channels: fmt.channels, totalSamples: samples }
+  }
   const pcm = new Int16Array(samples * fmt.channels)
   for (let i = 0; i < pcm.length; i++)
     pcm[i] = dv.getInt16(dataOff + i * 2, true)
@@ -1845,7 +1874,7 @@ function concatBytes(parts) {
 const jsonCache = new Map()
 
 /** 读 JSON（按 mtime 缓存，避免每次请求都重复解析同一个大文件） */
-function readJsonCached(file) {
+export function readJsonCached(file) {
   try {
     const mtimeMs = fs.statSync(file).mtimeMs
     const hit = jsonCache.get(file)
@@ -1923,9 +1952,9 @@ export async function assembleUsmFromChunks(gameId, file, { version = '', dataDi
   if (!version) {
     const versionsPath = path.join(dataDir, `${gameId}_versions.json`)
     if (fs.existsSync(versionsPath)) {
-      const versions = JSON.parse(fs.readFileSync(versionsPath, 'utf-8'))
+      const versions = readJsonCached(versionsPath)
       // 裸 sort() 是字典序, 会把 '1.9.0' 排在 '1.10.0' 之后而选错版本
-      version = Object.keys(versions).sort(compareVersions).at(-1) ?? ''
+      version = Object.keys(versions ?? {}).sort(compareVersions).at(-1) ?? ''
     }
   }
   if (!version)
@@ -1944,43 +1973,35 @@ export async function assembleUsmFromChunks(gameId, file, { version = '', dataDi
   }
   if (!chunkInfo.url_prefix)
     throw new Error(`版本 ${version} 缺少 chunk 下载前缀`)
-  const tmpPath = path.join(dataDir, 'usm', `_tmp_${gameId}_${Date.now()}.usm`)
-  fs.mkdirSync(path.dirname(tmpPath), { recursive: true })
-  try {
-    await downloadChunkFile(chunkInfo, tmpPath, log)
-    log(`[usm] chunk 组装完成: ${file} (${chunkInfo.size} 字节)`)
-    return fs.readFileSync(tmpPath)
-  }
-  finally {
-    try { fs.unlinkSync(tmpPath) } catch { /* 忽略 */ }
-  }
+  // chunk 数据在 downloadChunkFile 内存里已经拼好, 不再落临时文件再读回
+  const buf = await downloadChunkFile(chunkInfo, '', log, { skipWrite: true })
+  log(`[usm] chunk 组装完成: ${file} (${buf.length} 字节)`)
+  return buf
 }
 
 export function gameStatus(dataDir) {
   const status = {}
   for (const [id, game] of Object.entries(GAMES)) {
     const item = { name: game.name, versions: 0, latest_version: null, predownload: null }
-    const vp = path.join(dataDir, `${id}_versions.json`)
-    if (fs.existsSync(vp)) {
+    const versions = readJsonCached(path.join(dataDir, `${id}_versions.json`))
+    if (versions) {
       try {
-        const versions = Object.keys(JSON.parse(fs.readFileSync(vp, 'utf-8')))
-        item.versions = versions.length
+        const keys = Object.keys(versions)
+        item.versions = keys.length
         // 裸 sort() 是字典序, 会把 '1.9.0' 排在 '1.10.0' 之后而选错版本
-        item.latest_version = [...versions].sort(compareVersions).at(-1) ?? null
+        item.latest_version = [...keys].sort(compareVersions).at(-1) ?? null
       }
       catch { /* 忽略 */ }
     }
-    const pp = path.join(dataDir, 'predownload', `${id}.json`)
-    if (fs.existsSync(pp)) {
-      try {
-        const d = JSON.parse(fs.readFileSync(pp, 'utf-8'))
-        item.predownload = {
-          version: d.predownload_version ?? null,
-          generated_at: d.generated_at ?? null,
-          tags: d.tags ?? [],
-        }
+    // /api/games 是前端常调的接口, predownload payload 有 2.7MB,
+    // 走 loadPredownloadPayload 的 mtime 缓存而不是每次重新解析
+    const pre = loadPredownloadPayload(id, dataDir)
+    if (pre) {
+      item.predownload = {
+        version: pre.predownload_version ?? null,
+        generated_at: pre.generated_at ?? null,
+        tags: pre.tags ?? [],
       }
-      catch { /* 忽略 */ }
     }
     status[id] = item
   }

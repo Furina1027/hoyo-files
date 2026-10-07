@@ -79,6 +79,10 @@ export function parseWavPcm(wav: Uint8Array): WavPcm {
   if (!fmt || dataOff < 0 || fmt.bits !== 16)
     throw new Error('WAV 格式不支持 (需 16bit PCM)')
   const samples = Math.floor(dataLen / 2 / fmt.channels)
+  const byteOffset = wav.byteOffset + dataOff
+  // data chunk 2 字节对齐且平台小端 (现实所有 JS 平台): 直接建视图, 免逐样本复制
+  if (byteOffset % 2 === 0 && new Uint8Array(new Uint16Array([1]).buffer)[0] === 1)
+    return { pcm: new Int16Array(wav.buffer, byteOffset, samples * fmt.channels), sampleRate: fmt.sampleRate, channels: fmt.channels, totalSamples: samples }
   const pcm = new Int16Array(samples * fmt.channels)
   for (let i = 0; i < pcm.length; i++)
     pcm[i] = dv.getInt16(dataOff + i * 2, true)

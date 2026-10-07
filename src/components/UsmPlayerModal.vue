@@ -3,7 +3,7 @@ import type { ChunkManifest, ParsedChunk } from '@/types'
 import type { UsmKeyEntry } from '@/utils/usm_demux'
 import { API_BASE, AUDIO_LANG_LABELS, GameList } from '@/constants/core'
 import { useSettings } from '@/store/settings'
-import { decodeAdx, extractAdxFromUsm } from '@/utils/adx_decoder'
+import { decodeAdx, extractAdxFromChunks } from '@/utils/adx_decoder'
 import { downloadChunks } from '@/utils/chunk'
 import { fetchAndParseManifest } from '@/utils/manifest'
 import { decodeHcaToWav, getUsmStreamDecoder, parseWavPcm } from '@/utils/usm'
@@ -455,8 +455,8 @@ function switchChannel(chNo: number) {
 let accumulatedUsmBytes: Uint8Array[] = []
 
 /** 取指定 chno 第一个 @SFA 数据块头部 (ADX `80 00` / HCA 最高位混淆 magic 判别用) */
-function firstAudioChunkHead(usmBytes: Uint8Array, chno: number): Uint8Array {
-  for (const c of parseUsmChunks(usmBytes)) {
+function firstAudioChunkHead(chunks: ReturnType<typeof parseUsmChunks>, chno: number): Uint8Array {
+  for (const c of chunks) {
     if (c.type === '@SFA' && c.chno === chno && c.data.length >= 2)
       return c.data
   }
@@ -481,6 +481,10 @@ async function loadAdxAudio(usmBytes: Uint8Array, signal: AbortSignal) {
     gainNode.connect(audioCtx.destination)
   }
 
+  // 整份 USM 只解析一次: 原来每个通道在 firstAudioChunkHead 和
+  // extractAdxFromUsm 里各全量解析一遍, 4 通道 = 8 次遍历几百 MB。
+  const allChunks = parseUsmChunks(usmBytes)
+
   for (let chno = 0; chno < numChannels; chno++) {
     if (signal.aborted)
       return
@@ -489,18 +493,18 @@ async function loadAdxAudio(usmBytes: Uint8Array, signal: AbortSignal) {
       let sampleRate: number
       let channels: number
       // 4.5 method2 剧情视频的 @SFA 是 HCA (magic 最高位混淆), 其余为 ADX
-      const head = firstAudioChunkHead(usmBytes, chno)
+      const head = firstAudioChunkHead(allChunks, chno)
       const isHca = head.length > 1 && (head[0] & 0x7F) === 0x48 && (head[1] & 0x7F) === 0x43
       if (isHca) {
         if (!hcaAudioKeyHex)
           throw new Error('缺少 audioKey')
         // HCA 不经过 ADX mask；历史 67 直接把原始 HCA 字节交给 HCA 解码器。
-        const hca = await extractAdxFromUsm(usmBytes, chno, '', false)
+        const hca = await extractAdxFromChunks(allChunks, chno, '', false)
         const wav = await decodeHcaToWav(hca, hcaAudioKeyHex)
         ;({ pcm, sampleRate, channels } = parseWavPcm(wav))
       }
       else {
-        const adx = await extractAdxFromUsm(usmBytes, chno, maskKeyHex)
+        const adx = await extractAdxFromChunks(allChunks, chno, maskKeyHex)
         ;({ pcm, sampleRate, channels } = decodeAdx(adx))
       }
       const totalSamples = pcm.length / channels
@@ -654,6 +658,9 @@ async function fetchFirstChunk(signal: AbortSignal): Promise<Uint8Array | null> 
     return null
   const json = await res.json()
   const manifests: ChunkManifest[] = json.data?.manifests ?? []
+  // 游戏文件基本都在 matching_field === 'game' 的 manifest 里, 排到最前,
+  // 避免串行扫描时把上百个无关 manifest 全部拉一遍 (排序稳定, 保序)
+  manifests.sort((a, b) => (a.matching_field === 'game' ? 0 : 1) - (b.matching_field === 'game' ? 0 : 1))
   for (const m of manifests) {
     if (signal.aborted)
       return null
@@ -1071,6 +1078,8 @@ async function streamChunks(
     throw new Error(`Chunk 列表获取失败：HTTP ${res.status}`)
   const json = await res.json()
   const manifests: ChunkManifest[] = json.data?.manifests ?? []
+  // 同 fetchFirstChunk: 'game' 分类优先, 大幅缩短 chunk 回退路径的命中时间
+  manifests.sort((a, b) => (a.matching_field === 'game' ? 0 : 1) - (b.matching_field === 'game' ? 0 : 1))
 
   let chunkUrlPrefix = ''
   let foundFile: { chunks: ParsedChunk[] } | null = null

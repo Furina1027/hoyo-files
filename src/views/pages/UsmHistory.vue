@@ -405,21 +405,33 @@ const settings = useSettings()
 
 const chunkLoadingVersion = ref<string | null>(null)
 
-/** 该文件在 CDN 侧是否取得到字节（任一「存在过」的版本能落到 直链 或 chunk） */
-function hasCdnResource(file: ProcessedFile): boolean {
+/** CDN 侧取得到字节的文件集合。
+ *  原来模板里每行都调 hasCdnResource (内部多次 compareSemver filter+sort),
+ *  2500+ 行每次渲染就是几十万次比较; 预计算成 Set 后每行只查一次哈希。 */
+const cdnAvailableSet = computed<Set<string>>(() => {
+  const set = new Set<string>()
   const vData = versionsQuery.data.value ?? {}
   const allGameVersions = sortedVersionList.value
-  const availableVersions = file.versions
-    .filter(v => v.state === 'AVAILABLE')
-    .map(v => v.version)
-    .sort(compareSemver)
+  for (const file of allFiles.value) {
+    const availableVersions = file.versions
+      .filter(v => v.state === 'AVAILABLE')
+      .map(v => v.version)
+      .sort(compareSemver)
+    const ok = file.versions.some((entry) => {
+      if (entry.state !== 'AVAILABLE')
+        return false
+      const candidates = getEntryCandidates(file.versions, entry.version, availableVersions, allGameVersions)
+      return candidates.some(gv => vData[gv]?.decompressed_path || vData[gv]?.chunk)
+    })
+    if (ok)
+      set.add(file.path)
+  }
+  return set
+})
 
-  return file.versions.some((entry) => {
-    if (entry.state !== 'AVAILABLE')
-      return false
-    const candidates = getEntryCandidates(file.versions, entry.version, availableVersions, allGameVersions)
-    return candidates.some(gv => vData[gv]?.decompressed_path || vData[gv]?.chunk)
-  })
+/** 该文件在 CDN 侧是否取得到字节（任一「存在过」的版本能落到 直链 或 chunk） */
+function hasCdnResource(file: ProcessedFile): boolean {
+  return cdnAvailableSet.value.has(file.path)
 }
 
 /** 本地游戏目录里存在的 USM 路径（CDN 已下架时的回退来源） */

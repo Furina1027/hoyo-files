@@ -233,6 +233,11 @@ function mergeFiles(mainFiles: GameFileRecord[], audioLists: Map<string, GameFil
   return merged
 }
 
+// files 的合并结果单独缓存: currentFileSource 依赖 isLoadingFiles 等状态,
+// 每次状态翻转都会重建整个 source 对象; 若 files 在对象里就地合并, 每次都会
+// 生成新数组, 把 FileBrowser 里上万条文件的全量排序也拖着重算一遍。
+const mergedFiles = computed(() => mergeFiles(mainFileList.value, audioFileLists.value))
+
 const browserAudioOptions = computed(() => {
   return supportedAudioLangs.value.map(lang => ({
     lang,
@@ -389,7 +394,7 @@ function onDownloadChunkFile(payload: { file: GameFileRecord, version: string })
 
 const currentFileSource = computed<FileBrowserSource>(() => ({
   version: selectedVersion.value ?? '',
-  files: mergeFiles(mainFileList.value, audioFileLists.value),
+  files: mergedFiles.value,
   isLoading: isLoadingFiles.value,
   error: fileLoadError.value,
   decompressedPath: versionData.value?.decompressed_path ?? null,

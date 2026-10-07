@@ -148,32 +148,27 @@ export function parseSps(sps: Uint8Array): SpsInfo {
 }
 
 // ---------- NAL 工具 ----------
+
+/** 从 from 起找下一个 start code (00 00 01 / 00 00 00 01), 返回其起始下标; 没有 -1 */
+function findStartCode(data: Uint8Array, from: number, len: number): number {
+  for (let j = from; j + 3 < len; j++) {
+    if (data[j] === 0 && data[j + 1] === 0 && (data[j + 2] === 1 || (data[j + 2] === 0 && data[j + 3] === 1)))
+      return j
+  }
+  return -1
+}
+
 export function splitAnnexB(data: Uint8Array): Uint8Array[] {
   const nalus: Uint8Array[] = []
-  let i = 0
   const len = data.length
-  while (i < len) {
-    let start = -1
-    for (let j = i; j + 3 < len; j++) {
-      if (data[j] === 0 && data[j + 1] === 0 && (data[j + 2] === 1 || (data[j + 2] === 0 && data[j + 3] === 1))) {
-        start = j
-        break
-      }
-    }
-    if (start < 0)
-      break
-    let end = start + 3
-    if (data[start + 2] === 0)
-      end = start + 4
-    let next = len
-    for (let j = end; j + 3 < len; j++) {
-      if (data[j] === 0 && data[j + 1] === 0 && (data[j + 2] === 1 || (data[j + 2] === 0 && data[j + 3] === 1))) {
-        next = j
-        break
-      }
-    }
-    nalus.push(data.slice(end, next))
-    i = next
+  let start = findStartCode(data, 0, len)
+  while (start !== -1) {
+    const end = start + (data[start + 2] === 0 ? 4 : 3)
+    // 一次前向扫描同时给出本 NAL 的终点和下一个 start code,
+    // 不再像旧实现那样每个 start code 被前后两轮各扫一遍
+    const next = findStartCode(data, end, len)
+    nalus.push(data.slice(end, next === -1 ? len : next))
+    start = next
   }
   return nalus
 }
@@ -183,8 +178,7 @@ export function nalType(nal: Uint8Array): number {
 }
 
 /** 按 AUD 切帧: 返回每个 access unit 的 NAL 组 (含 SPS/PPS/SEI) */
-export function splitAnnexBToFrames(h264: Uint8Array): Uint8Array[][] {
-  const nalus = splitAnnexB(h264)
+export function framesFromNalus(nalus: Uint8Array[]): Uint8Array[][] {
   const frames: Uint8Array[][] = []
   let cur: Uint8Array[] = []
   for (const nal of nalus) {
@@ -200,6 +194,11 @@ export function splitAnnexBToFrames(h264: Uint8Array): Uint8Array[][] {
   if (cur.length)
     frames.push(cur)
   return frames
+}
+
+/** 按 AUD 切帧: 返回每个 access unit 的 NAL 组 (含 SPS/PPS/SEI) */
+export function splitAnnexBToFrames(h264: Uint8Array): Uint8Array[][] {
+  return framesFromNalus(splitAnnexB(h264))
 }
 
 /** 构造 avcC (与 ffmpeg movenc 一致: SPS/PPS 含 nal header, numSPS=0xE1) */
@@ -275,6 +274,7 @@ function matrix(): Uint8Array {
 
 // ---------- 主转换: Annex-B → MP4 ----------
 export function annexbToMp4(h264: Uint8Array, fallbackFps = 30): Uint8Array {
+  // 全流只扫描一次: NAL 切分结果同时用于找 SPS/PPS 和分组帧
   const nalus = splitAnnexB(h264)
   if (!nalus.length)
     throw new Error('无 NAL 单元')
@@ -297,8 +297,8 @@ export function annexbToMp4(h264: Uint8Array, fallbackFps = 30): Uint8Array {
   const timescale = Math.round(frameRate) * 1000
   const frameDuration = 1000
 
-  // 按 access unit 分组 (AUD 切帧)
-  const frames = splitAnnexBToFrames(h264)
+  // 按 access unit 分组 (AUD 切帧), 复用上面的 nalus, 不再整流重新扫描
+  const frames = framesFromNalus(nalus)
   if (!frames.length)
     throw new Error('无视频帧')
 
