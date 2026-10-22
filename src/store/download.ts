@@ -402,6 +402,23 @@ export const useDownload = defineStore('download', () => {
       setTaskProgress(task.id, 99)
       triggerDownload(`${baseName}.mkv`, bytes, 'video/x-matroska')
     }
+    else if (fmt === 'vp9' && typeof keyEntry === 'object') {
+      // 绝区零 3.3 method2: VP9 + AES 只能由服务器解密后封装; USM 内无音轨
+      const t = tasks.value.find(x => x.id === task.id)
+      if (t)
+        t.name = `${baseName}.webm`
+      const webmParams = new URLSearchParams(params)
+      webmParams.set('audio', gameId === 'nap' ? '0' : '1')
+      const res = await fetch(`${API_BASE}/api/usm-webm?${webmParams}`, { signal })
+      if (!res.ok) {
+        const text = await res.text().catch(() => '')
+        throw new Error(text.replace(/^USM 转换失败:\s*/, '') || `HTTP ${res.status}`)
+      }
+      const bytes = await streamResponseWithProgress(res, pct => setTaskProgress(task.id, pct))
+      setTaskStatus(task.id, 'merging')
+      setTaskProgress(task.id, 99)
+      triggerDownload(`${baseName}.webm`, bytes, 'video/webm')
+    }
     else if (fmt === 'h264') {
       const t = tasks.value.find(x => x.id === task.id)
       // 崩铁: H.264 USM 的 @SFA 是 ADX 音频, 服务器封装为含音轨的 MKV

@@ -26,19 +26,29 @@ VITE_API_BASE="http://localhost:8787"
 
 ```
 GET  /api/games                         各游戏数据状态
-POST /api/refresh/:game                 一键刷新 (启动器凭据 → 预下载差异/文件清单)
+POST /api/refresh/:game                 一键刷新 (版本/chunk/直链安装包/预下载差异/清单/USM 历史)
 GET  /api/predownload-summary/:game     预下载汇总 (各 tag 统计, 小响应)
 GET  /api/predownload/:game?tag&dir&q   目录浏览 (按需加载, 与游戏内目录一致)
 POST /api/predownload-download/:game    下载预下载文件 (files[] 或 dirs[], 按游戏内目录落盘)
 ```
 
-刷新逻辑 (server/refresh.mjs, 零依赖):
+刷新逻辑 (server/refresh.mjs, 零依赖, 不依赖任何上游数据仓库):
 
-1. `getGameBranches` 启动器接口 → 当前版本 + 预下载分支的 包ID/密码 (官方最新凭据)
-2. 预下载存在 → `getPatchBuild` → 下载校验全部 manifest → 生成 `predownload/{game}.json`
+1. `getGameBranches` 启动器接口 → 当前版本 (`main`) + 预下载分支 (`pre_download`) 的 包ID/密码/tag
+2. `getGamePackages` → 直链安装包: `major` (完整包分卷 / 语音包 / `res_list_url`) 与 `patches`
+   (增量包); 只有 `major.version === 目标 tag` 时才采用 (全量包停发后官方仍会返回旧版本)
+3. 预下载存在 → `getPatchBuild` → 下载校验全部 manifest → 生成 `predownload/{game}.json`
    (含每个文件的 bundle 定位信息, 供下载功能使用)
-3. 当前版本本地无文件清单 → `getBuild` → 生成 `{game}/{ver}/pkg_version` + chunk 快照
-4. 更新 `{game}_versions.json` 的当前版本条目与凭据
+4. 预下载版本 (`pre_download.tag` > `main.tag`) → `getBuild(branch=predownload)` 返回的是
+   **下一版本完整包** → 与正式版完全同构地落盘:
+   - `chunk/{game}_{ver}.json` (chunk 快照)
+   - `{game}/{ver}/pkg_version` + `Audio_*_pkg_version` (从 chunk 下载清单本体)
+   - `{game}_versions.json` 版本条目 (chunk 凭据 + 直链安装包)
+5. 当前版本 → `getBuild(branch=main)`; build_id 未变且清单已存在则只更新凭据, 变了才重下清单
+6. 同步更新 `usm/{game}_history.json` (预下载版本优先使用自己的完整清单)
+
+> 发布日官方只把预下载分支移到 `main`: 再刷新一次即可, build 未变时复用本地清单与快照,
+> 仅更新 `chunk.branch` 等凭据, 前端无需任何迁移操作。
 
 预下载文件下载 (无需本地客户端文件):
 
@@ -49,18 +59,10 @@ POST /api/predownload-download/:game    下载预下载文件 (files[] 或 dirs[
 - 输出: 服务器下载到 `downloads/{game}/<游戏内路径>`; 浏览器直下为保存对话框
 - 目标版本 chunk 索引首次生成约 5-10 秒, 之后秒回 (`chunk/{game}_{ver}.index.json`)
 
-## 刷新数据 (可选)
+## 数据维护
 
-数据由「设置 → 数据管理」的刷新按钮维护，无需命令行。
-如需用外部工具（如 hoyo-sophon）单独刷预下载数据：
-
-```bash
-cd ../hoyo-sophon
-python -m sophon predownload --versions ../pkg_version/nap_versions.json \
-    --game nap -o ../pkg_version/predownload/nap.json
-```
-
-没有活动预下载时命令会提示 "当前没有活动预下载", 前端页面显示「暂无预下载数据」。
+数据完全由「设置 → 数据管理」的刷新按钮维护，无需命令行，也不依赖任何上游数据仓库；
+刷新会同时更新版本条目、文件清单、chunk 快照、直链安装包、预下载差异与 USM 历史。
 
 ## USM 在线播放
 

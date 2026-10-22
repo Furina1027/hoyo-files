@@ -8,9 +8,10 @@
  *
  * 产物:
  *  predownload/{game}.json           预下载差异 (前端「预下载」页)
- *  {game}/{version}/pkg_version      当前版本文件清单 (前端「文件列表」页)
- *  chunk/{game}_{version}.json       当前版本 chunk 快照
- *  {game}_versions.json              版本条目 (含 chunk 凭据)
+ *  {game}/{version}/pkg_version      版本文件清单 (当前版本 + 预下载版本)
+ *  chunk/{game}_{version}.json       版本 chunk 快照
+ *  {game}_versions.json              版本条目 (chunk 凭据 + 直链安装包)
+ *  usm/{game}_history.json           USM 文件历史 (随版本刷新自动更新)
  */
 
 import { createHash, createDecipheriv } from 'node:crypto'
@@ -23,9 +24,9 @@ import { ZSTDDecoder } from 'zstddec'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 export const GAMES = {
-  hk4e: { name: '原神', launcher_id: 'jGHBHlcOq1', game_ids: ['1Z8W5NHUQb'] },
-  hkrpg: { name: '崩坏：星穹铁道', launcher_id: 'jGHBHlcOq1', game_ids: ['64kMb5iAWu'] },
-  nap: { name: '绝区零', launcher_id: 'jGHBHlcOq1', game_ids: ['x6znKlJ0xK'] },
+  hk4e: { name: '原神', launcher_id: 'jGHBHlcOq1', game_ids: ['1Z8W5NHUQb'], usm: true },
+  hkrpg: { name: '崩坏：星穹铁道', launcher_id: 'jGHBHlcOq1', game_ids: ['64kMb5iAWu'], usm: true },
+  nap: { name: '绝区零', launcher_id: 'jGHBHlcOq1', game_ids: ['x6znKlJ0xK'], usm: true },
   bh3: { name: '崩坏3', launcher_id: 'jGHBHlcOq1', game_ids: ['osvnlOc0S8'] },
 }
 
@@ -194,6 +195,39 @@ export async function getBranches(game) {
   throw lastErr ?? new Error('getGameBranches 失败')
 }
 
+/**
+ * 游戏包信息: main / pre_download 各自的完整安装包 (major: game_pkgs/audio_pkgs/
+ * res_list_url) 与增量包 (patches)。
+ *
+ * 这是「直链安装包有没有」的唯一判据: major 非空 = 有完整安装包; patches 非空 =
+ * 有增量包。注意官方在全量包停发后仍会返回最后一个有全量包的版本 (如原神 5.5.0、
+ * 崩铁 4.4.0), 所以调用方必须校验 major.version === 目标版本才能采用。
+ */
+export async function getGamePackages(game) {
+  let lastErr
+  for (const host of LAUNCHER_HOSTS) {
+    try {
+      const params = new URLSearchParams()
+      for (const gid of game.game_ids)
+        params.append('game_ids[]', gid)
+      params.append('launcher_id', game.launcher_id)
+      const res = await fetch(`${host}/hyp/hyp-connect/api/getGamePackages?${params}`, {
+        headers: { 'User-Agent': UA },
+        signal: AbortSignal.timeout(30_000),
+      })
+      const j = await res.json()
+      const list = j.data?.game_packages ?? []
+      if (list.length)
+        return list[0]
+      lastErr = new Error(`retcode ${j.retcode} ${j.message}`)
+    }
+    catch (err) {
+      lastErr = err
+    }
+  }
+  throw lastErr ?? new Error('getGamePackages 失败')
+}
+
 export async function apiCall(api, creds) {
   let lastErr
   for (const host of API_HOSTS) {
@@ -353,8 +387,8 @@ async function buildPredownloadDiff(buildInfo) {
  *
  * 不能从 manifest 反推内容 —— 真实清单里每条记录都带 hash 字段 (xxHash64), 而
  * manifest 的 File 消息只有 file/chunks/is_folder/size/md5, 完全没有这个信息。
- * 实测: 真实安装目录里的 pkg_version 与 orilights/pkg_version 发布的逐字节相同,
- * 说明上游也是下载本体后直接发布, 不是生成的。
+ * 实测: 真实安装目录里的 pkg_version 与官方发布的逐字节相同, 说明官方也是
+ * 下载本体后直接发布, 不是生成的。
  *
  * matching_field 是官方的分类标识 (launcher API):
  *   'game'   → 主资源, pkg_version
@@ -367,7 +401,7 @@ async function buildPredownloadDiff(buildInfo) {
  *                         语音包清单完全相同 (同一文件名/大小), 去重后仍是 5 个
  *   hkrpg 5 个 manifest  → 语音 manifest 里没有自引用条目              → 只有 1 个
  *   bh3  2 个 manifest  → 完全没有语音分类                            → 只有 1 个
- * 与上游 orilights/pkg_version 各游戏实际发布的文件数一致。
+ * 与各游戏官方实际发布的文件数一致。
  *
  * 返回 Map<matching_field, { name, urlPrefix, entry }>, 只含确实存在自引用条目的分类。
  * 同一输出文件名只下载一次 (nap 的 mini-* 与常规语音包指向同一文件)。
@@ -413,9 +447,158 @@ async function locateListFileEntries(buildInfo, concurrency = 8) {
   return out
 }
 
+// ---------- 版本落盘 (清单 / chunk 快照 / 直链安装包) ----------
+
+/** 安装包 URL → versions.json 的 PkgFile 结构 (checksum 统一小写, 与历史条目一致) */
+function pkgFileOf(entry) {
+  const url = String(entry?.url ?? '')
+  return {
+    name: url.split('/').pop() ?? '',
+    url,
+    checksum: String(entry?.md5 ?? '').toLowerCase(),
+    size: Number(entry?.size ?? 0),
+  }
+}
+
+/**
+ * getGamePackages 的 main / pre_download → versions.json 条目的
+ * game / voice / update / decompressed_path 字段。
+ *
+ * 只认 major.version === 目标 tag: 官方在停发全量包后仍会返回最后一个有全量包的
+ * 版本 (原神 5.5.0 / 崩铁 4.4.0 / 崩坏3 8.4.0), 若直接套到当前版本上就是张冠李戴,
+ * 所以版本对不上时返回 null, 保持条目的既有字段不动。
+ */
+function packagesToVersionFields(sidePkg, tag) {
+  const major = sidePkg?.major
+  if (!major || major.version !== tag)
+    return null
+
+  const fields = { game: {}, voice: {}, update: {}, decompressed_path: null }
+
+  const segments = (major.game_pkgs ?? []).filter(p => p?.url).map(pkgFileOf)
+  if (segments.length === 1)
+    fields.game.full = segments[0]
+  else if (segments.length > 1)
+    fields.game.segments = segments
+
+  for (const audio of major.audio_pkgs ?? []) {
+    if (audio?.language && audio.url)
+      fields.voice[audio.language] = pkgFileOf(audio)
+  }
+
+  for (const patch of sidePkg.patches ?? []) {
+    if (!patch?.version)
+      continue
+    const entry = { voice: {} }
+    const gamePkg = (patch.game_pkgs ?? []).find(p => p?.url)
+    if (gamePkg)
+      entry.game = pkgFileOf(gamePkg)
+    for (const audio of patch.audio_pkgs ?? []) {
+      if (audio?.language && audio.url)
+        entry.voice[audio.language] = pkgFileOf(audio)
+    }
+    fields.update[patch.version] = entry
+  }
+
+  if (major.res_list_url)
+    fields.decompressed_path = String(major.res_list_url)
+
+  return fields
+}
+
+/**
+ * 从 getBuild 快照下载该版本的清单文件本体 (pkg_version + 各语言语音包清单)。
+ * 清单文件是游戏安装包里的真实文件, 按 chunk 下载后直接落盘, 不能从 manifest 反推。
+ */
+async function downloadVersionLists(gameId, dataDir, version, buildInfo, log = () => {}) {
+  const located = await locateListFileEntries(buildInfo)
+  const listDir = path.join(dataDir, gameId, version)
+  fs.mkdirSync(listDir, { recursive: true })
+  let total = 0
+  for (const [key, hit] of located) {
+    if (!hit.urlPrefix) {
+      log(`[${gameId}]   ${hit.name}: manifest 未提供 chunk_download.url_prefix, 跳过`)
+      continue
+    }
+    const out = path.join(listDir, hit.name)
+    await downloadChunkFile({
+      url_prefix: hit.urlPrefix,
+      url_suffix: '',
+      size: hit.entry.size,
+      md5: hit.entry.md5,
+      chunks: hit.entry.chunks,
+    }, out, log)
+    const count = fs.readFileSync(out, 'utf-8').split('\n').filter(s => s.trim()).length
+    total += count
+    log(`[${gameId}]   ${hit.name} (${key}): ${hit.entry.size} 字节 / ${count} 条 (${hit.entry.chunks.length} 个 chunk)`)
+  }
+  const absent = ALL_LIST_FILES.filter(t => !located.has(t.field)).map(t => t.name)
+  if (absent.length)
+    log(`[${gameId}]   该版本无对应清单文件: ${absent.join(', ')}`)
+  return { total, lists: located.size }
+}
+
+/**
+ * 确保某个分支版本在本地是一份「完整版本」:
+ *   chunk/{game}_{tag}.json    getBuild 快照 (chunk 下载的 url_prefix 都在里面)
+ *   {game}/{tag}/pkg_version   该版本完整文件清单 (+ 有就下语音包清单)
+ *
+ * getBuild 的 branch=predownload 返回的就是下一版本的完整包 (不是增量), 因此预下载
+ * 分支和 main 分支走完全相同的落盘逻辑; 发布日 main 指向同一 tag 时, 若 build_id
+ * 未变则只更新凭据, 变了才重下清单覆盖。
+ */
+async function ensureBuildSnapshot(gameId, dataDir, creds, log = () => {}) {
+  const version = creds.tag
+  if (!version)
+    throw new Error('分支缺少 tag')
+
+  const chunkDir = path.join(dataDir, 'chunk')
+  const snapshotPath = path.join(chunkDir, `${gameId}_${version}.json`)
+  const snapshotExists = fs.existsSync(snapshotPath)
+  let prevBuildId = null
+  let snapshotOk = false
+  if (snapshotExists) {
+    try {
+      prevBuildId = JSON.parse(fs.readFileSync(snapshotPath, 'utf-8'))?.data?.build_id ?? null
+      snapshotOk = true
+    }
+    catch { /* 快照损坏 → 重写 */ }
+  }
+
+  log(`[${gameId}] 拉取 ${version} (${creds.branch ?? 'main'}) 的 getBuild 快照...`)
+  const buildInfo = await apiCall('getBuild', {
+    branch: creds.branch ?? 'main',
+    package_id: creds.package_id,
+    password: creds.password,
+  })
+  const tag = buildInfo.data?.tag
+  if (tag && tag !== version)
+    throw new Error(`官方 getBuild 返回 ${tag}, 与分支 tag ${version} 不一致`)
+  const buildId = buildInfo.data?.build_id ?? null
+  const changed = snapshotExists && (!snapshotOk || (!!prevBuildId && !!buildId && prevBuildId !== buildId))
+
+  fs.mkdirSync(chunkDir, { recursive: true })
+  if (!snapshotExists || changed)
+    fs.writeFileSync(snapshotPath, JSON.stringify(buildInfo), 'utf-8')
+
+  const listPath = path.join(dataDir, gameId, version, 'pkg_version')
+  const listMissing = !fs.existsSync(listPath)
+  let fileList
+  if (listMissing || changed) {
+    const downloaded = await downloadVersionLists(gameId, dataDir, version, buildInfo, log)
+    fileList = { version, files: downloaded.total }
+    log(`[${gameId}] ${version} 文件清单已下载: ${downloaded.total} 条 (${downloaded.lists} 个清单文件)`)
+  }
+  else {
+    fileList = { version, existed: true }
+  }
+
+  return { version, build_id: buildId, file_list: fileList, rebuilt: listMissing || changed }
+}
+
 // ---------- versions.json ----------
 
-function updateVersionsJson(dataDir, gameId, branch) {
+function updateVersionsJson(dataDir, gameId, branch, packages = null) {
   const p = path.join(dataDir, `${gameId}_versions.json`)
   let data = {}
   if (fs.existsSync(p)) {
@@ -434,6 +617,13 @@ function updateVersionsJson(dataDir, gameId, branch) {
     package_id: branch.package_id,
     password: branch.password,
     tag: ver,
+  }
+  // 直链安装包信息 (版本对不上时不传 packages, 保留既有字段)
+  if (packages) {
+    entry.game = packages.game ?? {}
+    entry.voice = packages.voice ?? {}
+    entry.update = packages.update ?? {}
+    entry.decompressed_path = packages.decompressed_path ?? null
   }
   data[ver] = entry
   fs.writeFileSync(p, JSON.stringify(data, null, 2), 'utf-8')
@@ -455,8 +645,19 @@ export async function refreshGame(gameId, dataDir, log = () => {}) {
     name: game.name,
     main_tag: main?.tag ?? null,
     predownload: null,
+    predownload_version: null,
     file_list: null,
     versions_updated: false,
+  }
+
+  // 0) 直链安装包信息 (main / pre_download 一次取回)
+  let gamePackages = null
+  try {
+    gamePackages = await getGamePackages(game)
+  }
+  catch (err) {
+    result.packages_error = err.message
+    log(`[${gameId}] 安装包信息获取失败: ${err.message}`)
   }
 
   // 1) 预下载差异 (branch 用启动器返回的原值, 不可硬编码 'predownload')
@@ -507,67 +708,60 @@ export async function refreshGame(gameId, dataDir, log = () => {}) {
     }
   }
 
-  // 2) 当前版本文件清单 (仅本地缺失时)
-  // 清单文件本身就在游戏安装包里, 按 chunk 下载本体 (含 hash 字段), 不能从 manifest 反推。
-  // 各游戏实际有几个清单取决于其 manifest 里哪些分类带自引用条目:
-  //   hk4e / nap → 5 个 (pkg_version + 4 语音包);  hkrpg / bh3 → 只有 pkg_version。
-  // 所以这里只以 pkg_version 为判据, 语音包有多少下多少, 缺了也不报警告。
-  if (main?.tag) {
-    const listDir = path.join(dataDir, gameId, main.tag)
-    if (!fs.existsSync(path.join(listDir, 'pkg_version'))) {
-      try {
-        const buildInfo = await apiCall('getBuild', {
-          branch: main.branch ?? 'main',
-          package_id: main.package_id,
-          password: main.password,
-        })
-        const manifests = buildInfo.data?.manifests ?? []
-        if (manifests.length) {
-          log(`[${gameId}] 当前版本 ${main.tag} 无本地清单, 从 chunk 构建 (${manifests.length} 个 manifest)...`)
-          // chunk 快照
-          const chunkDir = path.join(dataDir, 'chunk')
-          fs.mkdirSync(chunkDir, { recursive: true })
-          fs.writeFileSync(path.join(chunkDir, `${gameId}_${main.tag}.json`), JSON.stringify(buildInfo), 'utf-8')
-          // 只解析可能含清单自引用条目的 manifest (nap 有 118 个, 绝大多数无关)
-          const located = await locateListFileEntries(buildInfo)
-          fs.mkdirSync(listDir, { recursive: true })
-          let total = 0
-          for (const [key, hit] of located) {
-            if (!hit.urlPrefix) {
-              log(`[${gameId}]   ${hit.name}: manifest 未提供 chunk_download.url_prefix, 跳过`)
-              continue
+  // 2) 预下载版本按「完整版本」落盘 (getBuild branch=predownload 返回下一版本完整包)
+  //    这样它在文件列表/版本对比/USM 历史里就是普通版本, 不需要等正式发布。
+  if (pre?.tag && main?.tag && compareVersions(pre.tag, main.tag) > 0) {
+    try {
+      const snap = await ensureBuildSnapshot(gameId, dataDir, pre, log)
+      const fields = packagesToVersionFields(gamePackages?.pre_download, pre.tag)
+      updateVersionsJson(dataDir, gameId, pre, fields)
+      result.predownload_version = {
+        tag: pre.tag,
+        build_id: snap.build_id,
+        file_list: snap.file_list,
+        packages: fields
+          ? {
+              segments: fields.game.full ? 1 : (fields.game.segments?.length ?? 0),
+              voice: Object.keys(fields.voice).length,
+              update: Object.keys(fields.update).length,
+              decompressed_path: fields.decompressed_path,
             }
-            const out = path.join(listDir, hit.name)
-            await downloadChunkFile({
-              url_prefix: hit.urlPrefix,
-              url_suffix: '',
-              size: hit.entry.size,
-              md5: hit.entry.md5,
-              chunks: hit.entry.chunks,
-            }, out, log)
-            const count = fs.readFileSync(out, 'utf-8').split('\n').filter(s => s.trim()).length
-            total += count
-            log(`[${gameId}]   ${hit.name} (${key}): ${hit.entry.size} 字节 / ${count} 条 (${hit.entry.chunks.length} 个 chunk)`)
-          }
-          const absent = ALL_LIST_FILES.filter(t => !located.has(t.field)).map(t => t.name)
-          if (absent.length)
-            log(`[${gameId}]   该版本无对应清单文件: ${absent.join(', ')}`)
-          result.file_list = { version: main.tag, files: total }
-          log(`[${gameId}] 文件清单已下载: ${total} 条 (${located.size} 个文件)`)
-        }
+          : null,
       }
-      catch (err) {
-        result.file_list = { error: err.message }
-        log(`[${gameId}] 文件清单下载失败: ${err.message}`)
-      }
+      log(`[${gameId}] 预下载版本 ${pre.tag} 已作为完整版本写入${fields ? ' (含直链安装包)' : ''}`)
     }
-    else {
-      result.file_list = { version: main.tag, existed: true }
+    catch (err) {
+      result.predownload_version = { tag: pre.tag, error: err.message }
+      log(`[${gameId}] 预下载版本 ${pre.tag} 落盘失败: ${err.message}`)
     }
+  }
 
-    // 3) versions.json 保持最新凭据
-    updateVersionsJson(dataDir, gameId, main)
-    result.versions_updated = true
+  // 3) 当前版本: chunk 快照/清单 + 直链安装包
+  if (main?.tag) {
+    try {
+      const snap = await ensureBuildSnapshot(gameId, dataDir, main, log)
+      result.file_list = snap.file_list
+      const fields = packagesToVersionFields(gamePackages?.main, main.tag)
+      updateVersionsJson(dataDir, gameId, main, fields)
+      result.versions_updated = true
+      if (fields)
+        log(`[${gameId}] ${main.tag} 直链安装包已更新`)
+    }
+    catch (err) {
+      result.file_list = { version: main.tag, error: err.message }
+      log(`[${gameId}] 当前版本 ${main.tag} 刷新失败: ${err.message}`)
+    }
+  }
+
+  // 4) USM 历史与版本数据一起刷新
+  if (game.usm) {
+    try {
+      result.usm_history = updateUsmHistory(gameId, dataDir, log)
+    }
+    catch (err) {
+      result.usm_history = { error: err.message }
+      log(`[${gameId}] USM 历史更新失败: ${err.message}`)
+    }
   }
 
   return result
@@ -669,13 +863,16 @@ function synthPredownloadList(dataDir, gameId, pre, log = () => {}) {
  * 只处理最新一个版本之间的差异 (以前版本不动)。
  *
  * 预下载联动: 若本地有 `predownload/{game}.json` 且其 predownload_version 比最新已发布版本更新,
- * 则「当前版本」取**预下载版本**(清单 = 基准版本清单 + 预下载差异推演), 对比基准 = 最新已发布版本。
- * 依据: 预下载只是临时的, 正式版内容与其一致 ⇒ 新文件应立刻进历史, 不必等正式版发布。
+ * 则「当前版本」取**预下载版本**, 对比基准 = 最新已发布版本。预下载版本在刷新时已经作为
+ * 完整版本落盘 (`{game}/{ver}/pkg_version`), 优先直接读它; 没有完整清单时才回退到
+ * 「基准清单 + 预下载差异」推演。依据: 预下载只是临时的, 正式版内容与其一致 ⇒
+ * 新文件应立刻进历史, 不必等正式版发布。
  *
- * 规则 (与 GitHub orilights/pkg_version 的 usm/*_history.json 完全一致):
+ * 规则:
  *   - 新增 (当前有、上版本无): 新增条目 {filename, state: AVAILABLE, versions:[{当前, AVAILABLE, md5, size}]}
  *   - 删除 (当前无、上版本有): 已有条目追加 {当前, DELETED, md5:null, size:null}, 条目 state → DELETED
  *   - 修改 (两边有但 md5 变): 已有条目追加 {当前, AVAILABLE, md5, size}
+ *   - 已存在同版本记录: 幂等跳过; 若官方重发构建导致 md5/size 变化则就地修正
  *   - 不变: 不追加
  *
  * @returns { {version, prev, added, deleted, changed, history_path} }
@@ -702,13 +899,24 @@ export function updateUsmHistory(gameId, dataDir, log = () => {}) {
   const latest = versions.at(-1) ?? null
   if (pre?.predownload_version && pre.predownload_version !== latest
     && (!latest || compareVersions(pre.predownload_version, latest) > 0)) {
-    const synth = latest ? synthPredownloadList(dataDir, gameId, pre, log) : null
-    if (synth) {
+    // 优先用预下载版本自己的完整清单 (刷新时已落盘), 缺失时才按差异推演
+    const realList = readUsmFilesFromList(dataDir, gameId, pre.predownload_version)
+    if (realList) {
       version = pre.predownload_version
       prev = latest
-      cur = synth.files
+      cur = realList
       old = readUsmFilesFromList(dataDir, gameId, prev)
-      log(`[${gameId}] USM 历史: 对比 ${prev} → ${version} (预下载版本, 基准清单 ${synth.tag})`)
+      log(`[${gameId}] USM 历史: 对比 ${prev} → ${version} (预下载版本完整清单)`)
+    }
+    else {
+      const synth = latest ? synthPredownloadList(dataDir, gameId, pre, log) : null
+      if (synth) {
+        version = pre.predownload_version
+        prev = latest
+        cur = synth.files
+        old = readUsmFilesFromList(dataDir, gameId, prev)
+        log(`[${gameId}] USM 历史: 对比 ${prev} → ${version} (预下载版本, 基准清单 ${synth.tag})`)
+      }
     }
   }
 
@@ -721,6 +929,7 @@ export function updateUsmHistory(gameId, dataDir, log = () => {}) {
     cur = readUsmFilesFromList(dataDir, gameId, version)
     if (!cur)
       throw new Error(`${version} 的 pkg_version 清单不存在`)
+    old = readUsmFilesFromList(dataDir, gameId, prev)
   }
   if (!old)
     throw new Error(`${prev} 的 pkg_version 清单不存在`)
@@ -741,16 +950,32 @@ export function updateUsmHistory(gameId, dataDir, log = () => {}) {
   const changed = []
 
   /**
-   * 追加版本记录到 history 条目 (跳过已存在的版本)
+   * 追加版本记录到 history 条目 (幂等)
+   * - 同版本 AVAILABLE 记录已存在: md5/size 一致 → 'skipped'; 不一致 (官方重发构建) → 就地修正
+   * - 同版本仅有 DELETED 记录 (官方把文件加回来): 覆盖为 AVAILABLE
    * @returns 'skipped' | 'added' | 'changed'
    */
   function recordAvailable(path, info) {
     const filename = path.slice(path.lastIndexOf('/') + 1)
     const rec = { version, state: 'AVAILABLE', md5: info.md5, size: info.size }
     if (history[path]) {
-      // 检查是否已有该版本记录 (幂等)
-      if (history[path].versions.some(v => v.version === version))
-        return 'skipped'
+      const existing = history[path].versions.find(v => v.version === version && v.state === 'AVAILABLE')
+      if (existing) {
+        if (existing.md5 === info.md5 && existing.size === info.size)
+          return 'skipped'
+        existing.md5 = info.md5
+        existing.size = info.size
+        history[path].state = 'AVAILABLE'
+        return 'changed'
+      }
+      const deletedSame = history[path].versions.find(v => v.version === version && v.state === 'DELETED')
+      if (deletedSame) {
+        deletedSame.state = 'AVAILABLE'
+        deletedSame.md5 = info.md5
+        deletedSame.size = info.size
+        history[path].state = 'AVAILABLE'
+        return 'changed'
+      }
       history[path].state = 'AVAILABLE'
       history[path].versions.push(rec)
       return 'changed'
@@ -787,12 +1012,21 @@ export function updateUsmHistory(gameId, dataDir, log = () => {}) {
     const filename = path.slice(path.lastIndexOf('/') + 1)
     const rec = { version, state: 'DELETED', md5: null, size: null }
     if (history[path]) {
-      // 幂等: 已有该版本删除记录则跳过
-      if (!history[path].versions.some(v => v.version === version && v.state === 'DELETED')) {
-        history[path].state = 'DELETED'
-        history[path].versions.push(rec)
-        deleted.push(filename)
+      const same = history[path].versions.find(v => v.version === version)
+      if (same) {
+        // 幂等: 已有该版本记录; 若此前被记成 AVAILABLE (官方重发构建后删除), 就地修正
+        if (same.state === 'AVAILABLE') {
+          same.state = 'DELETED'
+          same.md5 = null
+          same.size = null
+          history[path].state = 'DELETED'
+          deleted.push(filename)
+        }
+        continue
       }
+      history[path].state = 'DELETED'
+      history[path].versions.push(rec)
+      deleted.push(filename)
     }
     else {
       // 上版本有但 history 无记录 (异常) — 先补上版本记录再标记删除
@@ -1299,7 +1533,7 @@ export async function detectUsmBytes(usm, { game = '', file = '', dataDir = null
     }
   }
   else if (key && typeof key === 'object' && key.aes) {
-    // 4.5 method2 (AES-CTR): 解密首个大块后探测
+    // method2 (AES-CTR, 原神 7.1 / 绝区零 3.3): 解密首个大块后探测
     const nonce = findVideoNonce(usm)
     const first = videoChunks.find(c => c.data.length > 0x400)
     if (nonce && first) {
@@ -1336,7 +1570,8 @@ export async function usmToMp4(url, opts = {}) {
  * 解析 key 条目为统一的解密模式。
  * keys.json 值有两种形态:
  *   - "16位hex" 字符串: 全零=明文, 非零=反馈式 XOR 掩码 (4.4 体系)
- *   - { aes: "<32hex>", audio: "<16hex>" } 对象: 4.5 method2 (AES-CTR 视频 + HCA 音频)
+ *   - { aes: "<32hex>", audio?: "<16hex>" } 对象: method2 (AES-CTR 视频;
+ *     原神 7.1 另含 HCA 音频 audio, 绝区零 3.3 无音频字段)
  *     (nonce 不入库 — 每个版本文件各不相同, 从 USM 字节的 VIDEO_HDRINFO 表现读)
  */
 function resolveKeyEntry(entry) {
@@ -1519,7 +1754,7 @@ async function transcodeMpeg1ToMp4(mpegStream, log = () => {}) {
 /**
  * USM 字节 → MP4 (与 hsr_usm2mp4.py 流程一致):
  *   - 只取 @SFV/EVID 视频块 (排除 @SFA 音频块)
- *   - key 决定解密方式: 字符串=掩码 XOR, 对象 {aes}=AES-CTR (4.5 method2), 全零/缺失=明文
+ *   - key 决定解密方式: 字符串=掩码 XOR, 对象 {aes}=AES-CTR (method2, 原神 7.1 / 绝区零 3.3), 全零/缺失=明文
  *   - H.264 直接封装; MPEG1 (4.5 TV 类) 借 ffmpeg 转码; VP9 抛错走流式播放
  */
 export async function usmBytesToMp4(usm, { game = '', file = '', dataDir = null, log = () => {} } = {}) {
@@ -1958,7 +2193,8 @@ function loadUsmPathKeys(dataDir, game) {
   if (!j || typeof j !== 'object')
     return null
   const map = (j.keys && typeof j.keys === 'object') ? j.keys : j
-  const entries = Object.entries(map).filter(([k, v]) => k && typeof k === 'string' && typeof v === 'string' && v)
+  const entries = Object.entries(map).filter(([k, v]) => k && typeof k === 'string'
+    && (typeof v === 'string' || (v && typeof v === 'object' && typeof v.aes === 'string')))
   return entries.length ? entries : null
 }
 

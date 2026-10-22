@@ -27,8 +27,9 @@ export interface UsmChunk {
 /**
  * keys.json 条目类型:
  *   - "16位hex" 字符串: 全零=明文, 非零=反馈式 XOR 掩码 key (4.4 体系, 视频+音频共用)
- *   - { aes, audio } 对象: 4.5 method2 — aes=视频 AES-128-CTR 密钥 (32位hex),
- *     audio=HCA 音频 keycode (16位hex); nonce 不入库, 从 USM 的 VIDEO_HDRINFO 现读
+ *   - { aes, audio } 对象: method2 — aes=视频 AES-128-CTR 密钥 (32位hex),
+ *     audio=HCA 音频 keycode (16位hex, 原神 7.1; 绝区零 3.3 无音轨故缺省);
+ *     nonce 不入库, 从 USM 的 VIDEO_HDRINFO 现读
  */
 export type UsmKeyEntry = string | { aes: string, audio?: string }
 

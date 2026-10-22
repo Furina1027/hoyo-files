@@ -1413,7 +1413,9 @@
   "Gacha_Nekomata": "003DA1A0985077FE",
   "Gacha_Nicole": "005B9320BD4352A6",
   "Gacha_Norano": "0061B611B4223F01",
-  "Gacha_Norma": "0062D71C1023F260",
+  "Gacha_Norma": {
+    "aes": "3d2549141b94feb147d162153f9f7aa8"
+  },
   "Gacha_Nostradamus": "00642D8ADD45A2D1",
   "Gacha_OP_1": "00252A4FEE363970",
   "Gacha_OP_1_Bangboo": "002F5315D0DDBD6B",
@@ -1443,7 +1445,9 @@
   "Gacha_Starlight_Billy": "002671A62B4606EE",
   "Gacha_Sunna": "0087FF937C497F08",
   "Gacha_Trigger": "00148F99000F9D89",
-  "Gacha_Velina": "009D0625FA0763D2",
+  "Gacha_Velina": {
+    "aes": "62a7f174a8ce0e465c5f146b78a4ec6d"
+  },
   "Gacha_Vivian": "004A6EE7C130E4A7",
   "Gacha_WeaponContrast_01": "003980CFF6E60A6D",
   "Gacha_WeaponContrast_02": "009CB8DE4E572FA8",
@@ -1472,7 +1476,9 @@
   "Gacha_WeaponContrast_Lycaon": "00E4DD1E0DB9BB2F",
   "Gacha_WeaponContrast_Miyabi": "00210093769F521F",
   "Gacha_WeaponContrast_NangongYu": "005848698EE4CE8F",
-  "Gacha_WeaponContrast_Norma": "001070E00B6414B6",
+  "Gacha_WeaponContrast_Norma": {
+    "aes": "8e4d2eeda524e63f94edbc66507aa07d"
+  },
   "Gacha_WeaponContrast_OokumaMari": "000CEE14AB955FAF",
   "Gacha_WeaponContrast_Promeia": "00C44F5EF696686D",
   "Gacha_WeaponContrast_Pryce": "0000000000000000",
@@ -1484,7 +1490,9 @@
   "Gacha_WeaponContrast_Summer": "00FEEB44FD62890E",
   "Gacha_WeaponContrast_Trigger": "006684A5F81E9B13",
   "Gacha_WeaponContrast_Tsubaki": "005E5F6039A125A3",
-  "Gacha_WeaponContrast_Velina": "004C3439684A5D88",
+  "Gacha_WeaponContrast_Velina": {
+    "aes": "0f9021d5ab46f69fed66d0fa6ccbe1e3"
+  },
   "Gacha_WeaponContrast_Vivian": "00A4E746DBD7F683",
   "Gacha_WeaponContrast_Yanagi": "00A329A265B106A2",
   "Gacha_WeaponContrast_YiXuan": "000DA1D4DFFC301A",
@@ -2109,7 +2117,7 @@
   "TutorialAvatarVideo1091_3": "00AA60728F8A449B",
   "TutorialAvatarVideo1101_1": "003CEEE42BF57C25",
   "TutorialAvatarVideo1101_2": "00D79FA670F9D0A0",
-  "TutorialAvatarVideo1101_3": "0000000000000000",
+  "TutorialAvatarVideo1101_3": "00C716B2243A1DBF",
   "TutorialAvatarVideo1111_1": "00215AA4B26470A4",
   "TutorialAvatarVideo1121_1": "00BDB704E6198F43",
   "TutorialAvatarVideo1121_2": "00AF650A6C7B98CD",
@@ -2234,11 +2242,11 @@
   "TutorialAvatarVideo1581_3": "0093B009F67DC2A9",
   "TutorialAvatarVideo1591_1": "00D22B8C6EB4D875",
   "TutorialAvatarVideo1591_2": "00F6EB483ACD4B2A",
-  "TutorialAvatarVideo1611_1": "0000000000000000",
-  "TutorialAvatarVideo1611_2": "0000000000000000",
-  "TutorialAvatarVideo1611_3": "0000000000000000",
-  "TutorialAvatarVideo1621_1": "0000000000000000",
-  "TutorialAvatarVideo1621_2": "0000000000000000",
+  "TutorialAvatarVideo1611_1": "006073AEAC9035D5",
+  "TutorialAvatarVideo1611_2": "0074E44B77871AC3",
+  "TutorialAvatarVideo1611_3": "008E5999907EB686",
+  "TutorialAvatarVideo1621_1": "001EED191954A886",
+  "TutorialAvatarVideo1621_2": "0094554FCD6B56A8",
   "TutorialBabelTower1": "00170278CE608ACC",
   "TutorialBabelTower2": "002AB80168476866",
   "TutorialBabelTower3": "0023CBAB2E12EFD3",
@@ -2429,8 +2437,8 @@
   "Tutorial_ActivityMusicBattle_01.usm": "002A22F0684A124B",
   "Tutorial_ActivityMusicBattle_02": "00AC3E300D5FD61E",
   "Tutorial_ActivityMusicBattle_02.usm": "00C265DFD5234E5D",
-  "Tutorial_Armorer_01": "0000000000000000",
-  "Tutorial_Armorer_02": "0000000000000000",
+  "Tutorial_Armorer_01": "002B2B6DCABD002A",
+  "Tutorial_Armorer_02": "00F488DAB847DA5E",
   "Tutorial_BangbooDefence_2": "009861C199BBB1D3",
   "Tutorial_BangbooDefence_5": "00EAD969DDA079AC",
   "Tutorial_BangbooDream_Gun": "001A55D4FD9EB9FC",
@@ -2483,7 +2491,7 @@
   "Tutorial_HouseRhythmStage_06": "00E0563590AB3295",
   "Tutorial_LockedPropDoor_01": "0003E1E780BDAA9D",
   "Tutorial_MainCityAvatarForm_01": "00697899FFE3103C",
-  "Tutorial_MainStory_Wrestle_1": "0000000000000000",
+  "Tutorial_MainStory_Wrestle_1": "00F2BA708BABCBB7",
   "Tutorial_MarcelMaze": "00108A42E3196666",
   "Tutorial_MinetrackRailSwitch_1": "00216E64451EB182",
   "Tutorial_Minetrack_Video_1": "001F87698A2F6261",
@@ -2762,5 +2770,137 @@
   "Weapon_S_1621": "007F3331FD3CAFF2",
   "Weapon_B_Common_16": "00E1589B25EB0E3C",
   "C320_EP050B": "00542D99BEC01CCB",
-  "C320_EP050G": "00A2DC4A7CBB935C"
+  "C320_EP050G": "00A2DC4A7CBB935C",
+  "C330_EP020G": {
+    "aes": "6e0c22177aae9235ee6754057051e099"
+  },
+  "Role64_01": {
+    "aes": "9708eee5e420b7e62f4bac1b5dc32b5a"
+  },
+  "TutorialAvatarVideo1631_2": {
+    "aes": "ccecc41973afe440a1b4d56177a331e9"
+  },
+  "Gacha_Severian": {
+    "aes": "458d4d02183cac51a3a172a2c656543f"
+  },
+  "Gacha_WeaponContrast_Phoenix": {
+    "aes": "8754f3f4f3785466155f7a7f442acbe1"
+  },
+  "C330_EP050G": {
+    "aes": "d7a6ba3d1e6dc8691006e95cc289cda6"
+  },
+  "C330_EP010B": {
+    "aes": "1dfc223cf556c151c1fe9e5840799630"
+  },
+  "TutorialAvatarVideo1641_3": {
+    "aes": "86497c24a8d5c1415a39de68a46b90dc"
+  },
+  "Tutorial_HardCore_SymbioticEtherealSinner_02": {
+    "aes": "e36276306c2f717a70068fadbd32e30a"
+  },
+  "Role1631_01": {
+    "aes": "4c5cd20cbfd8ca501eb2860f06e07b69"
+  },
+  "Role65_01": {
+    "aes": "c35d0ed5fc6191e6ab522fff0afa54ff"
+  },
+  "Tutorial_HardCore_HereticHunter_01": {
+    "aes": "eb8c440c1c476f5e6740f65d478b7508"
+  },
+  "ScaryNight3_3": {
+    "aes": "c5beaf9563e2cf7433a916249f6e18f3"
+  },
+  "TutorialHackMecha_Tut01_3": {
+    "aes": "d5e348f965a6ec07a3d003327a535b78"
+  },
+  "Tutorial_HardCore_Hayyot_02": {
+    "aes": "ae620986498a0c0b6d205a5a650cab53"
+  },
+  "C330_EP030B": {
+    "aes": "f92c98814decdb3e508386454bb5d928"
+  },
+  "TutorialAvatarVideo1641_2": {
+    "aes": "2047de369351d9508202fa6d3dd2c1c6"
+  },
+  "C330_EP060G": {
+    "aes": "f1b416225bb109f61d7e0ee507c776e9"
+  },
+  "Role67_01": {
+    "aes": "d5a7bbc8e8e9681db6d480d64d3e1efa"
+  },
+  "C330_EP020B": {
+    "aes": "a58d3b9d6904b3d2b6a3a67fecd0de7c"
+  },
+  "Tutorial_HollowVenger_01": {
+    "aes": "015f1cb4c87737c229ac4a926291c99a"
+  },
+  "HardCore_Monster_HereticJester_HC": {
+    "aes": "e6acb3910d8374afd562a5c7f9005cd0"
+  },
+  "Weapon_S_1641": {
+    "aes": "d606be64f46cf7df9b385f2bc458a5f7"
+  },
+  "Gacha_WeaponContrast_Severian": {
+    "aes": "9def5a617ccef33a9375a0a36e793a3c"
+  },
+  "Gacha_Pheony": {
+    "aes": "20c8e92e38ae063e805789a69a002daf"
+  },
+  "Tutorial_HardCore_HereticHunter_03": {
+    "aes": "b9ce622fb28ed00006c782957a707105"
+  },
+  "C330_EP050B": {
+    "aes": "18f459b269e6be9589c4fc73140caed7"
+  },
+  "Tutorial_HardCore_Hayyot_01": {
+    "aes": "57ab9c0655b084a6cd21663641095f93"
+  },
+  "TutorialHackMecha_Tut01_4": {
+    "aes": "92a09f32a1def696c6da761adabfa3b1"
+  },
+  "C330_EP010G": {
+    "aes": "e7a11bb8e3860b02b4d2b0dbd1b22ff9"
+  },
+  "TutorialAvatarVideo1631_1": {
+    "aes": "46fbe2dd401152ac201fd050b568260d"
+  },
+  "Weapon_S_1631": {
+    "aes": "c28589861e7f44d3edcdf779bf367361"
+  },
+  "TutorialHackMecha_Tut01_2": {
+    "aes": "bc392670b0090d713eb7a526220ff1fc"
+  },
+  "Role63_01": {
+    "aes": "3e33b46f29c0e98c3379cda3b9d7b49f"
+  },
+  "Tutorial_HardCore_HereticHunter_02": {
+    "aes": "dd46fe468a04d74cfc1e63efe791ade1"
+  },
+  "HardCore_Monster_InfernalRevenant_HC": {
+    "aes": "47b4ea83a1046a2a3dea6fb77d30ced6"
+  },
+  "TutorialAvatarVideo1641_1": {
+    "aes": "bcaed923ae9f50247f00d711a858cb9e"
+  },
+  "C330_EP060B": {
+    "aes": "8536419d625c3e7a0e765f0637d9952d"
+  },
+  "C330_EP040": {
+    "aes": "9f9c01ecfdbbfe7509fe7029c37236fe"
+  },
+  "Tutorial_HardCore_SymbioticEtherealSinner_01": {
+    "aes": "c971bb5994b8deb4cafffb96483287e7"
+  },
+  "C330_EP030G": {
+    "aes": "d23222322af7dfe992deac2ff6860918"
+  },
+  "HardCore_Monster_Hayyot_HC": {
+    "aes": "b461b107ee19c699b806a499a73c69bf"
+  },
+  "Role1641_01": {
+    "aes": "44cd86f8001fefc70ed4d4cb15261718"
+  },
+  "Weapon_A_Common_22": {
+    "aes": "6950f05da1055d3faad597c321dead3f"
+  }
 }

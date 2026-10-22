@@ -26,7 +26,16 @@ interface RefreshResult {
     stats?: { added: number, modified: number, deleted: number }
     error?: string
   } | null
+  predownload_version: {
+    tag: string
+    build_id?: string
+    file_list?: { version: string, files?: number, existed?: boolean, error?: string }
+    packages?: { segments: number, voice: number, update: number, decompressed_path: string | null } | null
+    error?: string
+  } | null
+  packages_error?: string
   file_list: { version: string, files?: number, existed?: boolean, error?: string } | null
+  usm_history: { version?: string, prev?: string, added?: number, deleted?: number, changed?: number, error?: string } | null
 }
 
 const gameStatuses = ref<Record<string, GameDataStatus> | null>(null)
@@ -234,7 +243,7 @@ onMounted(() => {
                 <template v-if="gameStatuses[game.id]?.latest_version">
                   · 最新 {{ gameStatuses[game.id]!.latest_version }}
                 </template>
-                <template v-if="gameStatuses[game.id]?.predownload">
+                <template v-if="gameStatuses[game.id]?.predownload && gameStatuses[game.id]!.predownload!.version !== gameStatuses[game.id]!.latest_version">
                   · 预下载 {{ gameStatuses[game.id]!.predownload!.version }}
                 </template>
               </p>
@@ -318,7 +327,33 @@ onMounted(() => {
                   <template v-if="(refreshResults[game.id] as RefreshResult).file_list!.files">
                     ({{ (refreshResults[game.id] as RefreshResult).file_list!.files }} 个文件)
                   </template>
-                  <template v-else>已存在</template>
+                  <template v-else>
+                    已存在
+                  </template>
+                </template>
+              </p>
+              <p
+                v-if="(refreshResults[game.id] as RefreshResult).predownload_version"
+                class="mt-0.5 text-gray-600 dark:text-gray-400"
+              >
+                <template v-if="(refreshResults[game.id] as RefreshResult).predownload_version!.error">
+                  版本 {{ (refreshResults[game.id] as RefreshResult).predownload_version!.tag }}:
+                  {{ (refreshResults[game.id] as RefreshResult).predownload_version!.error }}
+                </template>
+                <template v-else>
+                  版本 {{ (refreshResults[game.id] as RefreshResult).predownload_version!.tag }}
+                  文件清单
+                  <template v-if="(refreshResults[game.id] as RefreshResult).predownload_version!.file_list?.files">
+                    ({{ (refreshResults[game.id] as RefreshResult).predownload_version!.file_list!.files }} 个文件)
+                  </template>
+                  <template v-else>
+                    已存在
+                  </template>
+                  <template v-if="(refreshResults[game.id] as RefreshResult).predownload_version!.packages">
+                    · 安装包 {{ (refreshResults[game.id] as RefreshResult).predownload_version!.packages!.segments }} 卷
+                    / 语音 {{ (refreshResults[game.id] as RefreshResult).predownload_version!.packages!.voice }}
+                    / 增量 {{ (refreshResults[game.id] as RefreshResult).predownload_version!.packages!.update }}
+                  </template>
                 </template>
               </p>
             </template>
