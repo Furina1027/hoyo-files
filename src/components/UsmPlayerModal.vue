@@ -106,11 +106,10 @@ let streamAudioNodes: AudioBufferSourceNode[] = []
 let streamAudioActive = false
 let streamAudioReady = false
 let audioTimeBase = 0
-let pendingPcmChunks: Array<{ chunk: any, idx: number }> = []
+let pendingPcmChunks: any[] = []
 
 let videoAudioSyncCleanup: (() => void) | null = null
 
-const SAMPLES_PER_CHUNK = 1024
 const mimeType = 'video/webm; codecs="vp9"'
 const MAX_SOURCE_BUFFER_QUEUE_BYTES = 16 * 1024 * 1024
 const MAX_BUFFER_AHEAD_SECONDS = 18
@@ -264,25 +263,42 @@ function makeSourceBufferQueue(sb: SourceBuffer, video: HTMLVideoElement) {
   }
 }
 
-function scheduleOnePcmChunk(chunk: any, idx: number) {
+function audioFrameCount(chunk: any): number {
+  if (!chunk.pcm_i16_bytes || !chunk.channel_count)
+    return 0
+  return Math.floor(chunk.pcm_i16_bytes.byteLength / 2 / chunk.channel_count)
+}
+
+function audioChunkDurationMs(chunk: any): number {
+  const frames = audioFrameCount(chunk)
+  return chunk.sample_rate > 0 ? frames * 1000 / chunk.sample_rate : 0
+}
+
+function scheduleOnePcmChunk(chunk: any) {
   if (!audioCtx)
     return
   const sr: number = chunk.sample_rate
   const nc: number = chunk.channel_count
-  const t = audioTimeBase + idx * SAMPLES_PER_CHUNK / sr
-  if (t + SAMPLES_PER_CHUNK / sr < audioCtx.currentTime - 0.05)
+  const frames = audioFrameCount(chunk)
+  if (!sr || !nc || frames <= 0)
     return
-  const abuf = audioCtx.createBuffer(nc, SAMPLES_PER_CHUNK, sr)
+  const duration = frames / sr
+  const t = audioTimeBase + (chunk.playback_ms ?? 0) / 1000
+  const lateBy = Math.max(0, audioCtx.currentTime - t)
+  if (lateBy >= duration)
+    return
+  const abuf = audioCtx.createBuffer(nc, frames, sr)
   const i16 = new Int16Array(chunk.pcm_i16_bytes.buffer, chunk.pcm_i16_bytes.byteOffset, chunk.pcm_i16_bytes.byteLength / 2)
   for (let ch = 0; ch < nc; ch++) {
     const d = abuf.getChannelData(ch)
-    for (let i = 0; i < SAMPLES_PER_CHUNK; i++)
+    for (let i = 0; i < frames; i++)
       d[i] = i16[i * nc + ch] / 32768.0
   }
   const src = audioCtx.createBufferSource()
   src.buffer = abuf
   src.connect(gainNode ?? audioCtx.destination)
-  src.start(Math.max(t, audioCtx.currentTime))
+  // 迟到块从正确的样本偏移开始，避免整块重播与下一块重叠产生杂音
+  src.start(Math.max(t, audioCtx.currentTime), lateBy)
   streamAudioNodes.push(src)
 }
 
@@ -304,10 +320,9 @@ function rescheduleStreamAudio() {
   audioTimeBase = audioCtx.currentTime - videoRef.value.currentTime
   const vt = videoRef.value.currentTime
   const chunks = audioPcmByChannel.get(currentChannel.value) ?? []
-  for (let i = 0; i < chunks.length; i++) {
-    const sr: number = chunks[i].sample_rate
-    if ((i + 1) * SAMPLES_PER_CHUNK / sr >= vt - 0.05)
-      scheduleOnePcmChunk(chunks[i], i)
+  for (const chunk of chunks) {
+    if ((chunk.playback_ms + audioChunkDurationMs(chunk)) / 1000 >= vt - 0.05)
+      scheduleOnePcmChunk(chunk)
   }
 }
 
@@ -319,14 +334,25 @@ function feedAudioChunk(chunk: any) {
       audioChannelList.value.push(chNo)
   }
   const chChunks = audioPcmByChannel.get(chNo)!
-  const idx = chChunks.length
+  const previous = chChunks[chChunks.length - 1]
+  if (previous) {
+    // 解码器未必给出时间戳；按上一块实际结束时间续接，避免累计误差
+    const expected = previous.playback_ms + audioChunkDurationMs(previous)
+    const reported = typeof chunk.timestamp_ms === 'number' ? chunk.timestamp_ms : null
+    const correction = reported == null ? 0 : Math.abs(reported - expected)
+    const threshold = Math.max(5, audioChunkDurationMs(chunk) / 2)
+    chunk.playback_ms = reported != null && correction > threshold ? reported : expected
+  }
+  else {
+    chunk.playback_ms = 0
+  }
   chChunks.push(chunk)
   if (chNo !== currentChannel.value)
     return
   if (streamAudioReady)
-    scheduleOnePcmChunk(chunk, idx)
+    scheduleOnePcmChunk(chunk)
   else
-    pendingPcmChunks.push({ chunk, idx })
+    pendingPcmChunks.push(chunk)
 }
 
 function onStreamVideoPlaying() {
@@ -335,8 +361,8 @@ function onStreamVideoPlaying() {
   streamAudioReady = true
   audioTimeBase = audioCtx.currentTime - videoRef.value.currentTime
   audioStatusText.value = ''
-  for (const { chunk, idx } of pendingPcmChunks)
-    scheduleOnePcmChunk(chunk, idx)
+  for (const chunk of pendingPcmChunks)
+    scheduleOnePcmChunk(chunk)
   pendingPcmChunks.length = 0
 }
 
@@ -396,18 +422,21 @@ function buildAudioBuffer(chNo: number): AudioBuffer | null {
     return null
   const sr: number = chunks[0].sample_rate
   const nc: number = chunks[0].channel_count
-  const totalFrames = chunks.length * SAMPLES_PER_CHUNK
+  const totalFrames = chunks.reduce((sum, chunk) => sum + audioFrameCount(chunk), 0)
+  if (!nc || totalFrames <= 0)
+    return null
   try {
     const buf = audioCtx.createBuffer(nc, totalFrames, sr)
     let frameOffset = 0
     for (const chunk of chunks) {
+      const frames = audioFrameCount(chunk)
       const i16 = new Int16Array(chunk.pcm_i16_bytes.buffer, chunk.pcm_i16_bytes.byteOffset, chunk.pcm_i16_bytes.byteLength / 2)
       for (let ch = 0; ch < nc; ch++) {
         const channelData = buf.getChannelData(ch)
-        for (let i = 0; i < SAMPLES_PER_CHUNK; i++)
+        for (let i = 0; i < frames; i++)
           channelData[frameOffset + i] = i16[i * nc + ch] / 32768.0
       }
-      frameOffset += SAMPLES_PER_CHUNK
+      frameOffset += frames
     }
     return buf
   }
@@ -422,9 +451,7 @@ function switchChannel(chNo: number) {
   if (streamAudioActive) {
     if (!streamAudioReady) {
       pendingPcmChunks.length = 0
-      const newChunks = audioPcmByChannel.get(chNo) ?? []
-      for (let i = 0; i < newChunks.length; i++)
-        pendingPcmChunks.push({ chunk: newChunks[i], idx: i })
+      pendingPcmChunks.push(...(audioPcmByChannel.get(chNo) ?? []))
     }
     else {
       rescheduleStreamAudio()
@@ -763,8 +790,9 @@ async function playServerVp9(signal: AbortSignal) {
   catch (e) {
     if ((e as Error).name === 'AbortError')
       return
-    phase.value = 'error'
-    errorMsg.value = (e as Error).message || String(e)
+    // 交给 startStreaming 的 catch 回退 wasm 流式；最终失败由 startStreamingVP9 显示
+    console.warn('[usm] 服务端 VP9 播放失败, 回退 wasm 流式:', e)
+    throw e
   }
 }
 
