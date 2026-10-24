@@ -1,3 +1,4 @@
+import type { MkvAudioCodec } from '@/store/settings'
 import type { ChunkManifest, DownloadStatus, DownloadTask, GameFileRecord, ParsedFile } from '@/types'
 import type { UsmKeyEntry } from '@/utils/usm_demux'
 import { defineStore } from 'pinia'
@@ -127,6 +128,7 @@ export const useDownload = defineStore('download', () => {
     directDownloadUrl: string | null
     bestChunkVersion: string | null
     gameId: string
+    audioCodec: MkvAudioCodec
     chIndex?: number
     manifests?: ChunkManifest[]
   }>()
@@ -334,7 +336,7 @@ export const useDownload = defineStore('download', () => {
     if (!data)
       throw new Error('任务数据丢失')
 
-    const { filename, filePath, keyEntry, gameId } = data
+    const { filename, filePath, keyEntry, gameId, audioCodec } = data
     const controller = new AbortController()
     controllers.set(task.id, controller)
     const { signal } = controller
@@ -392,6 +394,7 @@ export const useDownload = defineStore('download', () => {
       const mkvParams = new URLSearchParams(params)
       if (data.chIndex != null)
         mkvParams.set('ch', String(data.chIndex))
+      mkvParams.set('acodec', audioCodec)
       const res = await fetch(`${API_BASE}/api/usm-mkv?${mkvParams}`, { signal })
       if (!res.ok) {
         const text = await res.text().catch(() => '')
@@ -430,6 +433,8 @@ export const useDownload = defineStore('download', () => {
       const mkvParams = new URLSearchParams(params)
       if (useMkv && data.chIndex != null)
         mkvParams.set('ch', String(data.chIndex))
+      if (useMkv)
+        mkvParams.set('acodec', audioCodec)
       const res = await fetch(`${API_BASE}${useMkv ? '/api/usm-mkv' : '/api/usm-mp4'}?${mkvParams}`, { signal })
       if (!res.ok) {
         const text = await res.text().catch(() => '')
@@ -533,6 +538,7 @@ export const useDownload = defineStore('download', () => {
     directDownloadUrl: string | null
     bestChunkVersion: string | null
     gameId: string
+    audioCodec: MkvAudioCodec
     chIndex?: number
   }) {
     const id = makeId()

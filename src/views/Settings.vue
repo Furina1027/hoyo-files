@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { MkvExportLang, UsmAudioLang } from '@/store/settings'
+import type { MkvAudioCodec, MkvExportLang, UsmAudioLang } from '@/store/settings'
 import type { CacheStats, CacheUnavailable } from '@/utils/idb'
 import { AUDIO_LANG_LABELS, API_BASE, GameList, ThemeOptions } from '@/constants/core'
 import { useSettings } from '@/store/settings'
@@ -129,6 +129,11 @@ const mkvExportLangOptions: { value: MkvExportLang, label: string }[] = [
   { value: 'ko-kr', label: AUDIO_LANG_LABELS['ko-kr'] },
 ]
 
+const mkvAudioCodecOptions: { value: MkvAudioCodec, label: string }[] = [
+  { value: 'flac', label: 'FLAC（无损）' },
+  { value: 'aac', label: 'AAC 256k（兼容）' },
+]
+
 type StatsResult = CacheStats | CacheUnavailable | null
 
 const cacheStats = ref<StatsResult>(null)
@@ -198,6 +203,10 @@ onMounted(() => {
       <div class="flex items-center gap-3 justify-between">
         <span class="text-sm text-gray-600 dark:text-gray-300">默认导出语言</span>
         <DropdownSelect v-model="settings.mkvExportLang" :options="mkvExportLangOptions" />
+      </div>
+      <div class="mt-3 flex items-center gap-3 justify-between">
+        <span class="text-sm text-gray-600 dark:text-gray-300">音频编码</span>
+        <DropdownSelect v-model="settings.mkvAudioCodec" :options="mkvAudioCodecOptions" />
       </div>
     </div>
 

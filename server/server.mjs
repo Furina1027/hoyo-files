@@ -564,6 +564,7 @@ async function handleRequest(req, res) {
     const rawCh = url.searchParams.get('ch')
     const parsedCh = rawCh == null || rawCh === '' ? null : Number(rawCh)
     const chIndex = Number.isInteger(parsedCh) && parsedCh >= 0 ? parsedCh : null
+    const audioCodec = url.searchParams.get('acodec') === 'aac' ? 'aac' : 'flac'
     const gameDir = url.searchParams.get('game_dir') ?? null
     let target = request.aliased ? '' : url.searchParams.get('url') ?? ''
     if (!target && version) {
@@ -578,7 +579,7 @@ async function handleRequest(req, res) {
       let mkv = null
       const localUsm = await fetchLocalUsm(game, file, msg => tlog(msg), gameDir)
       if (localUsm) {
-        mkv = await usmBytesToMkv(localUsm, { game, file, dataDir: DATA_ROOT, chIndex, log: msg => tlog(msg) })
+        mkv = await usmBytesToMkv(localUsm, { game, file, dataDir: DATA_ROOT, chIndex, audioCodec, log: msg => tlog(msg) })
       }
       if (!mkv && target) {
         try {
@@ -587,7 +588,7 @@ async function handleRequest(req, res) {
             signal: AbortSignal.timeout(300_000),
           })
           if (res0.ok) {
-            mkv = await usmBytesToMkv(new Uint8Array(await res0.arrayBuffer()), { game, file, dataDir: DATA_ROOT, chIndex, log: msg => tlog(msg) })
+            mkv = await usmBytesToMkv(new Uint8Array(await res0.arrayBuffer()), { game, file, dataDir: DATA_ROOT, chIndex, audioCodec, log: msg => tlog(msg) })
           }
           else {
             console.log(`[usm-mkv] 直链失败 HTTP ${res0.status}, 回退 chunk`)
@@ -599,7 +600,7 @@ async function handleRequest(req, res) {
       }
       if (!mkv) {
         const usm = await assembleUsmFromChunks(game, file, { version, dataDir: DATA_ROOT, log: msg => tlog(msg) })
-        mkv = await usmBytesToMkv(usm, { game, file, dataDir: DATA_ROOT, chIndex, log: msg => tlog(msg) })
+        mkv = await usmBytesToMkv(usm, { game, file, dataDir: DATA_ROOT, chIndex, audioCodec, log: msg => tlog(msg) })
       }
       const total = mkv.reduce((s, p) => s + p.length, 0)
       res.writeHead(200, {

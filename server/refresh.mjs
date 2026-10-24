@@ -1941,7 +1941,7 @@ async function runFfmpegWithInput(args, inputParts, log) {
   log(`[usm] ffmpeg 完成: ${args.at(-1)}`)
 }
 
-async function muxVp9WithFfmpeg(videoParts, audio, container, { log = () => {} } = {}) {
+async function muxVp9WithFfmpeg(videoParts, audio, container, { log = () => {}, audioCodec = 'flac' } = {}) {
   const os = await import('node:os')
   const stamp = `${Date.now()}_${Math.random().toString(16).slice(2)}`
   const outputPath = path.join(os.tmpdir(), `hoyo-files_${stamp}.${container === 'webm' ? 'webm' : 'mkv'}`)
@@ -1961,8 +1961,15 @@ async function muxVp9WithFfmpeg(videoParts, audio, container, { log = () => {} }
       args.push('-map', `${index + 1}:a:0`)
     args.push('-c:v', 'copy')
     if (tracks.length) {
-      args.push('-c:a', container === 'webm' ? 'libopus' : 'aac')
-      args.push('-b:a', container === 'webm' ? '128k' : '192k')
+      if (container === 'webm') {
+        args.push('-c:a', 'libopus', '-b:a', '128k')
+      }
+      else if (audioCodec === 'flac') {
+        args.push('-c:a', 'flac')
+      }
+      else {
+        args.push('-c:a', 'aac', '-b:a', '256k')
+      }
       const languages = ['chi', 'eng', 'jpn', 'kor']
       for (let index = 0; index < tracks.length; index++)
         args.push(`-metadata:s:a:${index}`, `language=${languages[tracks[index].channel] ?? 'und'}`)
@@ -2003,7 +2010,7 @@ export async function usmBytesToWebm(usm, { game = '', file = '', dataDir = null
  *   - 无音频/解密失败时抛错 (调用方降级为纯视频 WebM)
  * @param chIndex 音频通道下标 (0=第一语言...), 默认 0
  */
-export async function usmBytesToMkv(usm, { game = '', file = '', dataDir = null, chIndex = null, log = () => {} } = {}) {
+export async function usmBytesToMkv(usm, { game = '', file = '', dataDir = null, chIndex = null, audioCodec = 'flac', log = () => {} } = {}) {
   const h264Mod = await import(pathToFileURL(path.join(__dirname, '../src/utils/h264mux.ts')).href)
   const { splitAnnexBToFrames, parseSps, makeAvcC } = h264Mod
   const { muxMkv } = await import(pathToFileURL(path.join(__dirname, '../src/utils/mkvmux.ts')).href)
@@ -2015,7 +2022,7 @@ export async function usmBytesToMkv(usm, { game = '', file = '', dataDir = null,
     if (key.mode === 'aes' || key.mode === 'mask' || key.mode === 'plain') {
       const audio = await decodeAudioWavs(chunks, { game, file, dataDir, chIndex, log })
       // 与 H.264 分支一致, 统一返回分段数组 (ffmpeg 输出为单段)
-      return [await muxVp9WithFfmpeg(streamParts, audio, 'mkv', { log })]
+      return [await muxVp9WithFfmpeg(streamParts, audio, 'mkv', { log, audioCodec })]
     }
     throw new Error('VP9 视频请使用流式播放')
   }
@@ -2095,7 +2102,29 @@ export async function usmBytesToMkv(usm, { game = '', file = '', dataDir = null,
   )
   const total = mkvParts.reduce((s, p) => s + p.length, 0)
   log(`[usm] MKV ${total} 字节`)
+  if (audioCodec === 'flac' || audioCodec === 'aac')
+    return await remuxMkvAudio(mkvParts, audioCodec, log)
   return mkvParts
+}
+
+/** 把自研 muxer 的 PCM 音轨无损转封为 FLAC (或按选项转 AAC)，视频流直接 copy。 */
+async function remuxMkvAudio(parts, audioCodec, log = () => {}) {
+  const os = await import('node:os')
+  const outputPath = path.join(os.tmpdir(), `hoyo-files_${Date.now()}_${Math.random().toString(16).slice(2)}.mkv`)
+  try {
+    const args = ['-y', '-f', 'matroska', '-i', 'pipe:0', '-map', '0', '-c:v', 'copy']
+    if (audioCodec === 'flac')
+      args.push('-c:a', 'flac')
+    else
+      args.push('-c:a', 'aac', '-b:a', '256k')
+    args.push('-map_metadata', '0', '-f', 'matroska', outputPath)
+    log(`[usm] 音轨转封 ${audioCodec.toUpperCase()}...`)
+    await runFfmpegWithInput(args, parts, log)
+    return [new Uint8Array(fs.readFileSync(outputPath))]
+  }
+  finally {
+    try { fs.unlinkSync(outputPath) } catch {}
+  }
 }
 
 /** 在 Node 里跑前端 wasm 的 decode_hca: 输入 [HCA 流], 输出 WAV 字节。

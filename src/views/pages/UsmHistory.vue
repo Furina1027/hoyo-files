@@ -621,6 +621,7 @@ function onExportMkv(
     directDownloadUrl,
     bestChunkVersion,
     gameId: gameId.value,
+    audioCodec: settings.mkvAudioCodec,
     chIndex,
   })
   download.openList()
