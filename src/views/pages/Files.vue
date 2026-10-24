@@ -361,6 +361,7 @@ const chunkTotalStats = computed(() => {
 
 const CHUNK_ONLY_THRESHOLDS: Record<string, string> = {
   hk4e: '5.6.0',
+  hkrpg: '4.5.0',
   bh3: '8.5.0',
 }
 
